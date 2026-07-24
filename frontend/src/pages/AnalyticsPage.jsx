@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend } from 'recharts';
 import { api } from '../lib/api';
 import { subDays, format } from 'date-fns';
@@ -13,6 +13,8 @@ export default function AnalyticsPage({ onToast }) {
   const [summary, setSummary] = useState(null);
   const [loading, setLoading] = useState(true);
   const [range, setRange] = useState('30');
+  const [empSearch, setEmpSearch] = useState('');
+  const [empSort, setEmpSort] = useState({ key: 'name', dir: 'asc' });
 
   const load = async () => {
     setLoading(true);
@@ -31,6 +33,31 @@ export default function AnalyticsPage({ onToast }) {
     { name: 'Late', value: summary.totals.late, color: COLORS.late },
     { name: 'Absent', value: summary.totals.absent, color: COLORS.absent },
   ].filter(d => d.value > 0) : [];
+
+  const byEmployee = summary?.byEmployee || [];
+
+  const visibleEmployees = useMemo(() => {
+    const q = empSearch.trim().toLowerCase();
+    let rows = q
+      ? byEmployee.filter(e => e.name.toLowerCase().includes(q) || e.department.toLowerCase().includes(q))
+      : byEmployee;
+
+    const { key, dir } = empSort;
+    rows = [...rows].sort((a, b) => {
+      const av = a[key];
+      const bv = b[key];
+      const cmp = typeof av === 'string' ? av.localeCompare(bv) : av - bv;
+      return dir === 'asc' ? cmp : -cmp;
+    });
+
+    return rows;
+  }, [byEmployee, empSearch, empSort]);
+
+  const toggleEmpSort = (key) => {
+    setEmpSort(prev => prev.key === key ? { key, dir: prev.dir === 'asc' ? 'desc' : 'asc' } : { key, dir: 'asc' });
+  };
+
+  const sortIndicator = (key) => empSort.key === key ? (empSort.dir === 'asc' ? ' ▲' : ' ▼') : '';
 
   return (
     <div className="page">
@@ -133,7 +160,7 @@ export default function AnalyticsPage({ onToast }) {
           </div>
 
           {/* By Department */}
-          <div className="card">
+          <div className="card" style={{ marginBottom: 20 }}>
             <div className="card-header">
               <div className="card-title">Attendance by Department</div>
             </div>
@@ -173,6 +200,65 @@ export default function AnalyticsPage({ onToast }) {
                         </tr>
                       );
                     })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          {/* By Employee */}
+          <div className="card">
+            <div className="card-header flex-between">
+              <div className="card-title">Attendance by Employee</div>
+              <input
+                type="text"
+                placeholder="Search name or department…"
+                value={empSearch}
+                onChange={e => setEmpSearch(e.target.value)}
+                style={{ width: 220 }}
+              />
+            </div>
+            {byEmployee.length === 0 ? (
+              <div className="empty-state"><p>No employee data</p></div>
+            ) : visibleEmployees.length === 0 ? (
+              <div className="empty-state"><p>No employees match "{empSearch}"</p></div>
+            ) : (
+              <div className="table-wrap" style={{ maxHeight: 420, overflowY: 'auto' }}>
+                <table>
+                  <thead>
+                    <tr>
+                      <th style={{ cursor: 'pointer' }} onClick={() => toggleEmpSort('name')}>Employee{sortIndicator('name')}</th>
+                      <th style={{ cursor: 'pointer' }} onClick={() => toggleEmpSort('department')}>Department{sortIndicator('department')}</th>
+                      <th style={{ cursor: 'pointer' }} onClick={() => toggleEmpSort('total')}>Total{sortIndicator('total')}</th>
+                      <th style={{ cursor: 'pointer' }} onClick={() => toggleEmpSort('present')}>Present{sortIndicator('present')}</th>
+                      <th style={{ cursor: 'pointer' }} onClick={() => toggleEmpSort('late')}>Late{sortIndicator('late')}</th>
+                      <th style={{ cursor: 'pointer' }} onClick={() => toggleEmpSort('excused')}>Excused{sortIndicator('excused')}</th>
+                      <th style={{ cursor: 'pointer' }} onClick={() => toggleEmpSort('unexcused')}>Unexcused{sortIndicator('unexcused')}</th>
+                      <th style={{ cursor: 'pointer' }} onClick={() => toggleEmpSort('totalHours')}>Hours{sortIndicator('totalHours')}</th>
+                      <th style={{ cursor: 'pointer' }} onClick={() => toggleEmpSort('rate')}>Attendance %{sortIndicator('rate')}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {visibleEmployees.map(e => (
+                      <tr key={e.employee_id}>
+                        <td>{e.name}</td>
+                        <td>{e.department}</td>
+                        <td>{e.total}</td>
+                        <td style={{ color: 'var(--green)' }}>{e.present}</td>
+                        <td style={{ color: 'var(--amber)' }}>{e.late}</td>
+                        <td style={{ color: 'var(--green)' }}>{e.excused}</td>
+                        <td style={{ color: 'var(--red)' }}>{e.unexcused}</td>
+                        <td>{e.totalHours}</td>
+                        <td>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                            <div style={{ height: 6, flex: 1, background: 'var(--surface2)', borderRadius: 3 }}>
+                              <div style={{ height: '100%', borderRadius: 3, background: e.rate > 80 ? 'var(--green)' : e.rate > 60 ? 'var(--amber)' : 'var(--red)', width: `${e.rate}%` }} />
+                            </div>
+                            <span style={{ fontSize: 12, color: 'var(--text-muted)', minWidth: 32 }}>{e.rate}%</span>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
                   </tbody>
                 </table>
               </div>

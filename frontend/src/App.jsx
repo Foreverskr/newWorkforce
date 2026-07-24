@@ -1,5 +1,6 @@
 import { Routes, Route, useLocation } from 'react-router-dom';
 import { useState, useEffect, useCallback } from 'react';
+import { Moon, Sun } from 'lucide-react';
 import Sidebar from './components/Sidebar.jsx';
 import Toast from './components/Toast.jsx';
 import LoginPage from './pages/LoginPage.jsx';
@@ -11,6 +12,7 @@ import DriversPage from './pages/DriverPage.jsx';
 import LeavesPage from './pages/LeavesPage.jsx';
 import AnalyticsPage from './pages/AnalyticsPage.jsx';
 import SchedulePage from './pages/SchedulePage';
+import { ThemeProvider, useTheme } from './contexts/ThemeContext';
 import { api } from './lib/api.js';
 
 const PAGE_TITLES = {
@@ -23,9 +25,10 @@ const PAGE_TITLES = {
   '/analytics': 'Analytics',
 };
 
-export default function App() {
+function AppContent() {
   const location = useLocation();
   const [toasts, setToasts] = useState([]);
+  const { theme, toggleTheme } = useTheme();
 
   const [isLoggedIn, setIsLoggedIn] = useState(
     () => !!localStorage.getItem('at_auth')
@@ -88,12 +91,23 @@ export default function App() {
         <div className="topbar">
           <span className="topbar-title">{pageTitle}</span>
           <div className="topbar-actions">
+            <button className="btn btn-ghost" onClick={handleLogout}>
+              Logout
+            </button>
+            <button 
+              className="btn btn-ghost"
+              onClick={toggleTheme}
+              title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
+            >
+              {theme === 'dark' ? (
+                <Sun size={16} />
+              ) : (
+                <Moon size={16} />
+              )}
+            </button>
             <span className={`badge ${serverStatus}`}>
               <span className="badge-dot" /> {statusLabel}
             </span>
-            <button className="btn btn-outline" onClick={handleLogout}>
-              Logout
-            </button>
           </div>
         </div>
 
@@ -113,5 +127,13 @@ export default function App() {
         <Toast key={t.id} message={t.message} type={t.type} onClose={() => removeToast(t.id)} />
       ))}
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <ThemeProvider>
+      <AppContent />
+    </ThemeProvider>
   );
 }

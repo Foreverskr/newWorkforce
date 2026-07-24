@@ -311,6 +311,49 @@ export async function create(req, res) {
   res.status(201).json(data);
 }
 
+// POST bulk import (from Excel/Google Sheets upload, parsed client-side)
+// Expects: { records: [{ employee_id, date, clock_in, clock_out, status, notes }, ...] }
+// employee_id here must already be resolved to the internal employees.id UUID —
+// resolution from a human-readable code/name happens in the frontend before this is called.
+export async function bulkImport(req, res) {
+  const { records } = req.body;
+
+  if (!Array.isArray(records) || records.length === 0) {
+    return res.status(400).json({ error: 'records array is required' });
+  }
+
+  const invalid = records.findIndex(r => !r.employee_id || !r.date);
+  if (invalid !== -1) {
+    return res.status(400).json({ error: `Row ${invalid + 1} is missing employee_id or date` });
+  }
+
+  const rows = records.map(r => {
+    let hoursWorked = null;
+    if (r.clock_in && r.clock_out) {
+      const ci = new Date(`${r.date}T${r.clock_in}`);
+      const co = new Date(`${r.date}T${r.clock_out}`);
+      if (!isNaN(ci) && !isNaN(co)) hoursWorked = parseFloat(((co - ci) / 3600000).toFixed(2));
+    }
+    return {
+      employee_id: r.employee_id,
+      date: r.date,
+      clock_in: r.clock_in || null,
+      clock_out: r.clock_out || null,
+      status: r.status || 'present',
+      notes: r.notes || null,
+      hours_worked: hoursWorked,
+    };
+  });
+
+  const { data, error } = await supabase
+    .from('attendance')
+    .upsert(rows, { onConflict: 'employee_id,date' })
+    .select('*, employees(name, employee_id, department)');
+
+  if (error) return handleError(res, error);
+  res.status(201).json({ imported: data.length, records: data });
+}
+
 export async function remove(req, res) {
   const { error } = await supabase.from('attendance').delete().eq('id', req.params.id);
   if (error) return handleError(res, error);

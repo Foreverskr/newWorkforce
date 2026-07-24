@@ -37,6 +37,7 @@ export const api = {
   breakStart: (employee_id) => request('/attendance/break-start', { method: 'POST', body: JSON.stringify({ employee_id }) }),
   breakEnd:   (employee_id) => request('/attendance/break-end',   { method: 'POST', body: JSON.stringify({ employee_id }) }),
   manualAttendance: (body) => request('/attendance', { method: 'POST', body: JSON.stringify(body) }),
+  bulkImportAttendance: (records) => request('/attendance/bulk-import', { method: 'POST', body: JSON.stringify({ records }) }),
   deleteAttendance: (id) => request(`/attendance/${id}`, { method: 'DELETE' }),
 
   // Leaves

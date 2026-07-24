@@ -1,7 +1,52 @@
-import { useState, useEffect, useCallback } from 'react';
-import { Search, Plus, Trash2, Calendar } from 'lucide-react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { Search, Plus, Trash2, Calendar, Upload, Download } from 'lucide-react';
 import { api } from '../lib/api';
 import { format } from 'date-fns';
+import * as XLSX from 'xlsx';
+
+// Handles Excel/Sheets date cells. Sheets store dates as plain serial numbers
+// with no timezone attached, so we parse that number directly (pure arithmetic,
+// no JS Date involved) — the only reliable way to avoid off-by-one shifts for
+// users outside UTC. A Date object is only handled here as a defensive fallback,
+// using local getters since that's how such a Date would have been constructed.
+function normalizeImportDate(value) {
+  if (typeof value === 'number') {
+    const parsed = XLSX.SSF.parse_date_code(value);
+    if (parsed) {
+      return `${parsed.y}-${String(parsed.m).padStart(2, '0')}-${String(parsed.d).padStart(2, '0')}`;
+    }
+  }
+  if (value instanceof Date && !isNaN(value)) {
+    const yyyy = value.getFullYear();
+    const mm = String(value.getMonth() + 1).padStart(2, '0');
+    const dd = String(value.getDate()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd}`;
+  }
+  return String(value ?? '').trim();
+}
+
+// Handles "Clock In"/"Clock Out" cells the same way — parsed straight from the
+// numeric time serial (fraction of a day), with no JS Date/timezone involved.
+function normalizeImportTime(value) {
+  if (value === '' || value === null || value === undefined) return null;
+
+  if (typeof value === 'number') {
+    const totalSeconds = Math.round((value % 1) * 86400);
+    const hh = String(Math.floor(totalSeconds / 3600)).padStart(2, '0');
+    const mm = String(Math.floor((totalSeconds % 3600) / 60)).padStart(2, '0');
+    const ss = String(totalSeconds % 60).padStart(2, '0');
+    return `${hh}:${mm}:${ss}`;
+  }
+
+  if (value instanceof Date && !isNaN(value)) {
+    const hh = String(value.getHours()).padStart(2, '0');
+    const mm = String(value.getMinutes()).padStart(2, '0');
+    const ss = String(value.getSeconds()).padStart(2, '0');
+    return `${hh}:${mm}:${ss}`;
+  }
+
+  return String(value).trim();
+}
 
 function ManualModal({ employees, onClose, onSave }) {
   const [form, setForm] = useState({
@@ -83,6 +128,8 @@ export default function AttendancePage({ onToast }) {
   });
   const [search, setSearch] = useState('');
   const [showModal, setShowModal] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const fileInputRef = useRef(null);
 
   useEffect(() => { api.getEmployees().then(setEmployees); }, []);
 
@@ -118,6 +165,88 @@ export default function AttendancePage({ onToast }) {
 
   const setF = k => e => setFilters(f => ({ ...f, [k]: e.target.value }));
 
+  // Export currently filtered records to .xlsx — opens fine in Excel or Google Sheets (File > Import)
+  const handleExport = () => {
+    const rows = filtered.map(r => ({
+      'Employee Name': r.employees?.name || '',
+      'Employee Code': r.employees?.employee_id || '',
+      'Department': r.employees?.department || '',
+      'Date': r.date,
+      'Clock In': r.clock_in || '',
+      'Clock Out': r.clock_out || '',
+      'Hours': r.hours_worked ?? '',
+      'Status': r.status,
+      'Notes': r.notes || '',
+    }));
+
+    if (rows.length === 0) { onToast('No records to export', 'error'); return; }
+
+    const ws = XLSX.utils.json_to_sheet(rows);
+    ws['!cols'] = [{ wch: 20 }, { wch: 14 }, { wch: 16 }, { wch: 12 }, { wch: 10 }, { wch: 10 }, { wch: 8 }, { wch: 10 }, { wch: 24 }];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Attendance');
+    const filename = `attendance_${filters.start_date}_to_${filters.end_date}.xlsx`;
+    XLSX.writeFile(wb, filename);
+    onToast(`Exported ${rows.length} record(s)`, 'success');
+  };
+
+  // Import from an .xlsx/.xls/.csv file (works with files exported from Excel or Google Sheets).
+  // Matches rows to employees by "Employee Code" first, falling back to "Employee Name".
+  const handleImportFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImporting(true);
+    try {
+      const buffer = await file.arrayBuffer();
+      const wb = XLSX.read(buffer, { type: 'array' });
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+
+      if (rows.length === 0) { onToast('No rows found in file', 'error'); return; }
+
+      const byCode = new Map(employees.map(emp => [String(emp.employee_id).trim().toLowerCase(), emp]));
+      const byName = new Map(employees.map(emp => [String(emp.name).trim().toLowerCase(), emp]));
+
+      const records = [];
+      let skipped = 0;
+
+      for (const row of rows) {
+        const code = String(row['Employee Code'] ?? row['employee_code'] ?? '').trim().toLowerCase();
+        const name = String(row['Employee Name'] ?? row['Employee'] ?? row['employee_name'] ?? '').trim().toLowerCase();
+        const emp = (code && byCode.get(code)) || (name && byName.get(name));
+        const rawDate = row['Date'] ?? row['date'];
+
+        if (!emp || !rawDate) { skipped++; continue; }
+
+        records.push({
+          employee_id: emp.id,
+          date: normalizeImportDate(rawDate),
+          clock_in: normalizeImportTime(row['Clock In'] ?? row['clock_in']),
+          clock_out: normalizeImportTime(row['Clock Out'] ?? row['clock_out']),
+          status: String(row['Status'] || row['status'] || 'present').toLowerCase(),
+          notes: row['Notes'] || row['notes'] || null,
+        });
+      }
+
+      if (records.length === 0) {
+        onToast('No rows matched a known employee — check "Employee Code" or "Employee Name" column', 'error');
+        return;
+      }
+
+      const result = await api.bulkImportAttendance(records);
+      onToast(
+        `Imported ${result.imported} record(s)${skipped ? `, skipped ${skipped} unmatched row(s)` : ''}`,
+        'success'
+      );
+      load();
+    } catch (err) {
+      onToast(err.message || 'Import failed — check the file format', 'error');
+    } finally {
+      setImporting(false);
+      e.target.value = ''; // allow re-selecting the same file later
+    }
+  };
+
   return (
     <div className="page">
       <div className="flex-between" style={{ marginBottom: 24 }}>
@@ -125,9 +254,24 @@ export default function AttendancePage({ onToast }) {
           <h2 style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.5px' }}>Attendance Records</h2>
           <p className="text-dim text-sm" style={{ marginTop: 4 }}>{filtered.length} records</p>
         </div>
-        <button className="btn btn-primary" onClick={() => setShowModal(true)}>
-          <Plus size={14} /> Add Record
-        </button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <input
+            type="file"
+            ref={fileInputRef}
+            accept=".xlsx,.xls,.csv"
+            style={{ display: 'none' }}
+            onChange={handleImportFile}
+          />
+          <button className="btn btn-ghost" onClick={() => fileInputRef.current?.click()} disabled={importing}>
+            <Upload size={14} /> {importing ? 'Importing…' : 'Import'}
+          </button>
+          <button className="btn btn-ghost" onClick={handleExport}>
+            <Download size={14} /> Export
+          </button>
+          <button className="btn btn-primary" onClick={() => setShowModal(true)}>
+            <Plus size={14} /> Add Record
+          </button>
+        </div>
       </div>
 
       <div className="card" style={{ marginBottom: 20 }}>
