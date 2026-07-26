@@ -1,10 +1,26 @@
+import { getToken, clearSession } from '../utils/session.js';
+
 const BASE = '/api';
 
 async function request(path, options = {}) {
+  const token = getToken();
+
   const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...options.headers },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...options.headers,
+    },
     ...options,
   });
+
+  if (res.status === 401) {
+    // Token missing/expired/invalid — the backend is the source of truth here.
+    // Clear the stale session and tell the app to show the login screen.
+    clearSession();
+    window.dispatchEvent(new CustomEvent('session-expired'));
+  }
+
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || 'Request failed');
   return data;

@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { LogIn } from 'lucide-react';
+import { saveSession } from '../utils/session.js';
 
 const API = 'http://localhost:3001';
 
@@ -29,8 +30,9 @@ export default function LoginPage({ onLogin }) {
         return;
       }
 
-      // Save session
-      localStorage.setItem('at_auth', JSON.stringify(data.admin));
+      // Save session (admin + token) with login time + last-activity time,
+      // used for the 8hr absolute expiry and the idle timeout.
+      saveSession(data.admin, data.token);
       onLogin(data.admin);
 
     } catch (err) {

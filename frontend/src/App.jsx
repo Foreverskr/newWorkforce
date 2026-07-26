@@ -14,6 +14,8 @@ import AnalyticsPage from './pages/AnalyticsPage.jsx';
 import SchedulePage from './pages/SchedulePage';
 import { ThemeProvider, useTheme } from './contexts/ThemeContext';
 import { api } from './lib/api.js';
+import { useSessionTimeout } from './hooks/Usesessiontimeout.js';
+import { getSession, getSessionInvalidReason, clearSession } from './utils/session.js';
 
 const PAGE_TITLES = {
   '/': 'Dashboard',
@@ -30,12 +32,42 @@ function AppContent() {
   const [toasts, setToasts] = useState([]);
   const { theme, toggleTheme } = useTheme();
 
-  const [isLoggedIn, setIsLoggedIn] = useState(
-    () => !!localStorage.getItem('at_auth')
-  );
+  const [isLoggedIn, setIsLoggedIn] = useState(() => {
+    const session = getSession();
+    return !!session && !getSessionInvalidReason(session);
+  });
 
   // 'checking' | 'online' | 'offline'
   const [serverStatus, setServerStatus] = useState('checking');
+
+  const onToast = useCallback((message, type = 'success') => {
+    const id = Date.now();
+    setToasts(t => [...t, { id, message, type }]);
+  }, []);
+
+  const removeToast = useCallback((id) => {
+    setToasts(t => t.filter(x => x.id !== id));
+  }, []);
+
+  // Central logout, used by: the Logout button, the idle/8hr frontend timer,
+  // and 401s coming back from the API (backend-enforced expiry).
+  const handleLogout = useCallback((reason) => {
+    clearSession();
+    setIsLoggedIn(false);
+    if (reason === 'idle') onToast('You were logged out due to inactivity.', 'error');
+    if (reason === 'expired') onToast('Your session expired. Please sign in again.', 'error');
+  }, [onToast]);
+
+  // Frontend-side idle timer + absolute 8hr check (fast, no network needed)
+  useSessionTimeout(isLoggedIn, handleLogout);
+
+  // Backend-side enforcement: api.js dispatches this when any request comes
+  // back 401 (token missing/expired/invalid), which is the real source of truth.
+  useEffect(() => {
+    const onSessionExpired = () => handleLogout('expired');
+    window.addEventListener('session-expired', onSessionExpired);
+    return () => window.removeEventListener('session-expired', onSessionExpired);
+  }, [handleLogout]);
 
   useEffect(() => {
     let cancelled = false;
@@ -58,20 +90,6 @@ function AppContent() {
     };
   }, []);
 
-  const onToast = useCallback((message, type = 'success') => {
-    const id = Date.now();
-    setToasts(t => [...t, { id, message, type }]);
-  }, []);
-
-  const removeToast = useCallback((id) => {
-    setToasts(t => t.filter(x => x.id !== id));
-  }, []);
-
-  const handleLogout = () => {
-    localStorage.removeItem('at_auth');
-    setIsLoggedIn(false);
-  };
-
   if (!isLoggedIn) {
     return <LoginPage onLogin={() => setIsLoggedIn(true)} />;
   }
@@ -91,7 +109,7 @@ function AppContent() {
         <div className="topbar">
           <span className="topbar-title">{pageTitle}</span>
           <div className="topbar-actions">
-            <button className="btn btn-ghost" onClick={handleLogout}>
+            <button className="btn btn-ghost" onClick={() => handleLogout()}>
               Logout
             </button>
             <button 
