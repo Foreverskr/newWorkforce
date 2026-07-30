@@ -14,6 +14,8 @@ import scheduleRoutes, { templateRouter } from './routes/schedule.routes.js';
 import driversRoutes from './routes/drivers.routes.js';
 import healthRoutes from './routes/health.routes.js';
 import analyticsRoutes from './routes/analytics.routes.js';
+import fingerprintsRoutes from './routes/fingerprints.routes.js';
+import deviceRoutes from './routes/device.routes.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -25,8 +27,13 @@ app.use(express.json());
 app.use('/api/auth', authRoutes);
 app.use('/api/health', healthRoutes);
 
+// Device routes — auth'd via a shared device key (see middleware/deviceAuth.js),
+// NOT a user JWT, since the ESP32 never logs in as an admin/employee.
+app.use('/api/device', deviceRoutes);
+
 // Everything below requires a valid, non-expired token
 app.use('/api/employees', requireAuth, employeesRoutes);
+app.use('/api/employees/:employeeId/fingerprints', requireAuth, fingerprintsRoutes);
 app.use('/api/leaves', requireAuth, leavesRoutes);
 app.use('/api/attendance', requireAuth, attendanceRoutes);
 app.use('/api/shift-templates', requireAuth, templateRouter);

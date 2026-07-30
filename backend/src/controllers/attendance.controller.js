@@ -359,3 +359,213 @@ export async function remove(req, res) {
   if (error) return handleError(res, error);
   res.json({ message: 'Record deleted' });
 }
+
+// ─── DEVICE KIOSK (fingerprint, no buttons) ─────────────────────────────────
+// POST — called by the fingerprint kiosk after it resolves a scan to an
+// employee_id via /fingerprints/identify. No human input beyond placing a
+// finger, so THIS function decides clock-in vs clock-out automatically by
+// checking today's existing record. Reuses the same leave/schedule rules as
+// clockIn, and the same hours/break math as clockOut.
+export async function punch(req, res) {
+  const { employee_id } = req.body;
+  if (!employee_id) return res.status(400).json({ error: 'employee_id is required' });
+
+  const today = new Date().toISOString().split('T')[0];
+  const now = new Date();
+
+  const { data: record } = await supabase
+    .from('attendance')
+    .select('id, clock_in, clock_out, lunch_start, lunch_end, coffee_start, coffee_end')
+    .eq('employee_id', employee_id)
+    .eq('date', today)
+    .maybeSingle();
+
+  // Already completed today — nothing to do
+  if (record?.clock_in && record?.clock_out) {
+    return res.status(409).json({
+      action: 'already_done',
+      error: 'Already clocked in and out today',
+      record,
+    });
+  }
+
+  // ── CLOCK OUT branch ──────────────────────────────────────────────
+  if (record?.clock_in && !record?.clock_out) {
+    if (record.lunch_start && !record.lunch_end) {
+      return res.status(409).json({ error: 'Employee is currently on lunch break' });
+    }
+    if (record.coffee_start && !record.coffee_end) {
+      return res.status(409).json({ error: 'Employee is currently on coffee break' });
+    }
+
+    const clockOutTime = now.toTimeString().slice(0, 8);
+    const clockIn  = new Date(`${today}T${record.clock_in}`);
+    const clockOut = new Date(`${today}T${clockOutTime}`);
+    const grossMinutes = (clockOut - clockIn) / 60000;
+
+    let breakMinutes = 0;
+    if (record.lunch_start && record.lunch_end) {
+      breakMinutes += Math.round(
+        (new Date(`${today}T${record.lunch_end}`) - new Date(`${today}T${record.lunch_start}`)) / 60000
+      );
+    }
+    if (record.coffee_start && record.coffee_end) {
+      breakMinutes += Math.round(
+        (new Date(`${today}T${record.coffee_end}`) - new Date(`${today}T${record.coffee_start}`)) / 60000
+      );
+    }
+
+    const netMinutes  = grossMinutes - breakMinutes;
+    const hoursWorked = parseFloat((grossMinutes / 60).toFixed(2));
+    const netHours    = parseFloat((netMinutes / 60).toFixed(2));
+
+    const { data, error } = await supabase
+      .from('attendance')
+      .update({
+        clock_out: clockOutTime,
+        hours_worked: hoursWorked,
+        break_minutes: breakMinutes,
+        net_hours_worked: netHours,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', record.id)
+      .select('*, employees(name, employee_id, department)')
+      .single();
+
+    if (error) return handleError(res, error);
+    return res.json({ action: 'clock_out', ...data });
+  }
+
+  // ── CLOCK IN branch ───────────────────────────────────────────────
+  const { data: activeLeave } = await supabase
+    .from('leaves')
+    .select('id, type, start_date, end_date')
+    .eq('employee_id', employee_id)
+    .eq('status', 'approved')
+    .lte('start_date', today)
+    .gte('end_date', today)
+    .maybeSingle();
+
+  if (activeLeave) {
+    return res.status(403).json({
+      error: `Employee is on approved ${activeLeave.type} leave today (${activeLeave.start_date} → ${activeLeave.end_date})`,
+    });
+  }
+
+  const { data: todaysShift } = await supabase
+    .from('shift_assignments')
+    .select('id, is_day_off, shift_template_id')
+    .eq('employee_id', employee_id)
+    .eq('date', today)
+    .maybeSingle();
+
+  if (!todaysShift || todaysShift.is_day_off || !todaysShift.shift_template_id) {
+    return res.status(403).json({
+      error: 'No shift scheduled for today',
+    });
+  }
+
+  const { data: employee } = await supabase
+    .from('employees')
+    .select('shift_start')
+    .eq('id', employee_id)
+    .single();
+
+  let status = 'present';
+  if (employee?.shift_start) {
+    const [shiftH, shiftM] = employee.shift_start.split(':').map(Number);
+    const shiftDate = new Date(now);
+    shiftDate.setHours(shiftH, shiftM + 15, 0); // 15 min grace period
+    if (now > shiftDate) status = 'late';
+  }
+
+  const clockInTime = now.toTimeString().slice(0, 8);
+
+  const { data, error } = await supabase
+    .from('attendance')
+    .upsert(
+      [{ employee_id, date: today, clock_in: clockInTime, clock_out: null, hours_worked: null, status, notes: null }],
+      { onConflict: 'employee_id,date' }
+    )
+    .select('*, employees(name, employee_id, department)')
+    .single();
+
+  if (error) return handleError(res, error);
+  return res.status(201).json({ action: 'clock_in', ...data });
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
+// ADD to controllers/fingerprints.controller.js
+// ─────────────────────────────────────────────────────────────────────────
+
+// GET /api/device/fingerprints/pending-sync?device_id=kiosk-front-door-01
+// Called by the attendance kiosk (e.g. on boot, or on a timer) to ask:
+// "which enrolled employees do I not have a local template for yet?"
+export async function pendingSync(req, res) {
+  const { device_id } = req.query;
+  if (!device_id) return res.status(400).json({ error: 'device_id is required' });
+
+  // All enrolled fingerprints that HAVE template bytes saved (i.e. came from
+  // a device that successfully extracted them), grouped by employee.
+  const { data: allEnrolled, error } = await supabase
+    .from('employee_fingerprints')
+    .select('employee_id, slot_label, device_id, template_data, employees(name)')
+    .not('template_data', 'is', null);
+
+  if (error) return handleError(res, error);
+
+  // Group by employee_id + slot_label so we know, per (employee, slot),
+  // which device_ids already have it.
+  const bySlot = {};
+  for (const row of allEnrolled) {
+    const key = `${row.employee_id}:${row.slot_label}`;
+    if (!bySlot[key]) bySlot[key] = { employee_id: row.employee_id, slot_label: row.slot_label, name: row.employees.name, template_data: row.template_data, devices: [] };
+    bySlot[key].devices.push(row.device_id);
+  }
+
+  // Anything this device_id isn't already in the devices list for = pending
+  const pending = Object.values(bySlot)
+    .filter(entry => !entry.devices.includes(device_id))
+    .map(({ employee_id, slot_label, name, template_data }) => ({ employee_id, slot_label, name, template_data }));
+
+  res.json({ device_id, pending });
+}
+
+// POST /api/device/fingerprints/register-synced
+// body: { employee_id, slot_label, device_id, sensor_slot_id }
+// Called by the attendance kiosk AFTER it has successfully written a synced
+// template into its own sensor's local memory at sensor_slot_id.
+export async function registerSynced(req, res) {
+  const { employee_id, slot_label, device_id, sensor_slot_id } = req.body;
+
+  if (!employee_id || !slot_label || !device_id || sensor_slot_id === undefined) {
+    return res.status(400).json({ error: 'employee_id, slot_label, device_id, sensor_slot_id are required' });
+  }
+
+  // Copy the template_data forward too, so THIS device could itself act as
+  // a source for a third device down the line if you ever add one.
+  const { data: source } = await supabase
+    .from('employee_fingerprints')
+    .select('template_data')
+    .eq('employee_id', employee_id)
+    .eq('slot_label', slot_label)
+    .not('template_data', 'is', null)
+    .limit(1)
+    .maybeSingle();
+
+  const { data, error } = await supabase
+    .from('employee_fingerprints')
+    .insert([{
+      employee_id,
+      slot_label,
+      device_id,
+      sensor_slot_id,
+      template_data: source?.template_data || null,
+    }])
+    .select()
+    .single();
+
+  if (error) return handleError(res, error);
+  res.status(201).json(data);
+}

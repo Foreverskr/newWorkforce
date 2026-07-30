@@ -3,7 +3,7 @@ import { useEffect, useRef, useCallback } from 'react';
 import { getSession, touchSession, clearSession, getSessionInvalidReason } from '../utils/session.js';
 
 const ACTIVITY_EVENTS = ['mousemove', 'mousedown', 'keydown', 'scroll', 'touchstart'];
-const CHECK_INTERVAL_MS = 15 * 1000; // check every 15s — cheap, feels instant enough
+const CHECK_INTERVAL_MS = 30 * 60 * 1000; // check every 30 minutes
 
 /**
  * Call this once near the top of your app (e.g. in App.jsx), while logged in.

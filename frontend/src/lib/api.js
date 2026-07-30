@@ -42,6 +42,18 @@ export const api = {
   checkEmployeeInactivity: () => request('/employees/check-inactivity', { method: 'POST' }),
   getEmployeeInactivityLogs: () => request('/employees/inactivity-logs'),
 
+  // Fingerprint enrollment (primary + 2 backups per employee, captured by an
+  // ESP32 + sensor terminal — see routes/fingerprints.routes.js)
+  getEmployeeFingerprints: (employeeId) => request(`/employees/${employeeId}/fingerprints`),
+  requestFingerprintEnrollment: (employeeId, slot_label) =>
+    request(`/employees/${employeeId}/fingerprints/enroll-request`, { method: 'POST', body: JSON.stringify({ slot_label }) }),
+  getFingerprintRequestStatus: (employeeId, requestId) =>
+    request(`/employees/${employeeId}/fingerprints/requests/${requestId}`),
+  cancelFingerprintRequest: (employeeId, requestId) =>
+    request(`/employees/${employeeId}/fingerprints/requests/${requestId}`, { method: 'DELETE' }),
+  deleteEmployeeFingerprint: (employeeId, fingerprintId) =>
+    request(`/employees/${employeeId}/fingerprints/${fingerprintId}`, { method: 'DELETE' }),
+
   // Attendance
   getAttendance: (params = {}) => {
     const qs = new URLSearchParams(params).toString();

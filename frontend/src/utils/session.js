@@ -19,8 +19,8 @@
 
 const STORAGE_KEY = 'at_auth';
 
-export const SESSION_DURATION_MS = 2 * 60 * 1000; // 2 minutes (testing only!)
-export const IDLE_TIMEOUT_MS = 30 * 1000;         // 30 seconds idle (testing only!)
+export const SESSION_DURATION_MS = 8 * 60 * 60 * 1000; // 8 hours
+export const IDLE_TIMEOUT_MS = 30 * 60 * 1000;         // 30 minutes idle
 
 export function saveSession(admin, token) {
   const now = Date.now();

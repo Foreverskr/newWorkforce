@@ -3,7 +3,7 @@ import jwt from 'jsonwebtoken';
 import { supabase } from '../config/supabase.js';
 
 const JWT_SECRET = process.env.JWT_SECRET;
-const TOKEN_EXPIRY = '2m'; // testing only! // <- backend's source of truth for session length
+const TOKEN_EXPIRY = '8h'; // testing only! // <- backend's source of truth for session length
 
 export async function login(req, res) {
   const { username, password } = req.body;
