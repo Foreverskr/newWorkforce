@@ -29,6 +29,19 @@
 // has a guard that refuses to enroll rather than silently overwrite
 // slot 0 repeatedly; see the check in checkForJob().
 //
+// NEW: SERIAL TEXT COMMAND FOR THE OLED
+// -----------------------------------------------------------------------
+// Type into Serial Monitor (115200 baud, "Newline" line ending) either:
+//   text:Hello World
+//     -> shows "Hello World" on the OLED as a single line, and stays
+//        there for 3 seconds before returning to the normal "Ready"
+//        status. Useful for testing the display or wiring without
+//        needing a finger scan or a backend job to trigger showStatus().
+//   text:Hello World|Second line
+//     -> use a pipe "|" to split into two lines (top = big text,
+//        bottom = small text), matching how showStatus() already
+//        renders everywhere else in this file.
+//
 // Everything else in this file is unchanged from your previous version.
 
 #include <WiFi.h>
@@ -79,6 +92,36 @@ void showStatus(const String& line1, const String& line2 = "") {
   display.display();
 }
 
+// NEW: reads "text:..." commands from Serial Monitor and shows them on the
+// OLED via the existing showStatus() renderer. A "|" in the typed text
+// splits it into showStatus()'s two lines; otherwise it's shown as a
+// single top line. Returns to the normal "Ready" status after 3 seconds.
+void handleSerialCommands() {
+  if (!Serial.available()) return;
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+  if (cmd.length() == 0) return;
+
+  if (cmd.startsWith("text:")) {
+    String text = cmd.substring(5);
+    int barPos = text.indexOf('|');
+    if (barPos >= 0) {
+      String line1 = text.substring(0, barPos);
+      String line2 = text.substring(barPos + 1);
+      Serial.printf("Showing on OLED: \"%s\" / \"%s\"\n", line1.c_str(), line2.c_str());
+      showStatus(line1, line2);
+    } else {
+      Serial.printf("Showing on OLED: \"%s\"\n", text.c_str());
+      showStatus(text);
+    }
+    delay(3000);
+    showStatus("Ready", "Waiting for job");
+  } else {
+    Serial.println("Unknown command. Try: text:Your message here");
+    Serial.println("Or with two lines: text:Top line|Bottom line");
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(300);
@@ -109,9 +152,14 @@ void setup() {
   }
 
   connectWifi();
+
+  Serial.println("Type 'text:Your message' + Enter to show custom text");
+  Serial.println("on the OLED (use | to split into two lines).");
 }
 
 void loop() {
+  handleSerialCommands();
+
   if (WiFi.status() != WL_CONNECTED) connectWifi();
 
   if (millis() - lastPoll >= POLL_INTERVAL_MS) {

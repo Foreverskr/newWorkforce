@@ -1,50 +1,15 @@
-// ESP32 + AS608/R307 attendance kiosk — WITH OLED STATUS DISPLAY
+// ESP32 + AS608/R307 attendance kiosk — WITH 2.8" ILI9341 TFT STATUS DISPLAY
+// Adapted for Adafruit_ILI9341 (tested & working display)
 // -----------------------------------------------------------------------
-// NEW FIXES IN THIS REVISION (on top of the previous "FIXED VERSION"):
-//
-//   D. wipe now ALSO calls the backend's new
-//      /api/device/fingerprints/reset-device-sync endpoint before
-//      resyncing. Previously, wipe only cleared the physical sensor -
-//      the backend still believed everything was already synced, so
-//      pending-sync reported "0 pending" and the sensor stayed empty
-//      forever after a wipe. Now the backend's records are cleared too,
-//      so the resync that follows actually pulls everything back down.
-//
-//   E. The finger.getTemplateCount() guessing fallback in
-//      syncPendingTemplates() is REMOVED. pending-sync now always
-//      returns a real, backend-assigned existing_local_slot for every
-//      entry - including first-time syncs - so the firmware never needs
-//      to guess a slot number from local sensor state again. This
-//      closes the last remaining place slot numbers could drift.
-//
-//   F. syncPendingTemplates() now flushes the fingerSerial RX buffer and
-//      pauses briefly before AND after each entry's sensor commands.
-//      Without this, the first template in a multi-entry batch would
-//      sync fine, but every entry after it in the same batch would
-//      intermittently fail (storeModel returning a nonzero code, or the
-//      sensor rejecting the DOWNLOAD command outright) - most likely
-//      because the AS608/R307 needs a moment to settle after a
-//      storeModel + verify-upload round trip, and stray bytes lingering
-//      in the UART RX buffer were getting misread as the start of the
-//      next command's ACK. The failed entries would then succeed on the
-//      next sync cycle once they were "first" again, which is the
-//      signature this fix is meant to eliminate.
-//
-// Do this once, after flashing, to fully clear out old test data:
-//   1. Flash this sketch.
-//   2. Type `wipe` + Enter in Serial Monitor.
-//   3. Confirm you see "emptyDatabase returned 0", then
-//      "Backend reset: N rows removed", then the resync log.
-//
-// Everything else is unchanged from your previous version.
 
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Adafruit_Fingerprint.h>
-#include <Wire.h>
+#include <SPI.h>
 #include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <Adafruit_ILI9341.h>
+#include "time.h"
 #include "base64.h"
 
 // ─── CONFIG — fill these in ──────────────────────────────────────────────
@@ -61,20 +26,40 @@ const unsigned long SYNC_INTERVAL_MS   = 60000;
 #define FINGERPRINT_DOWNLOAD 0x09
 #define MIN_CONFIDENCE_THRESHOLD 80
 
-// ─── OLED CONFIG ──────────────────────────────────────────────────────────
-#define OLED_SDA        21
-#define OLED_SCL        22
-#define OLED_RESET      -1
-#define SCREEN_WIDTH   128
-#define SCREEN_HEIGHT   64
-#define OLED_I2C_ADDR 0x3C
-// ──────────────────────────────────────────────────────────────────────
+// ─── TFT CONFIG (ILI9341) ─────────────────────────────────────────────────
+#define TFT_CS   5
+#define TFT_DC   2
+#define TFT_RST  4
+// SCK/MOSI/MISO use ESP32's default VSPI pins (18 / 23 / 19)
+
+// ─── NTP / CLOCK CONFIG ───────────────────────────────────────────────────
+const char* NTP_SERVER   = "pool.ntp.org";
+const long  TZ_OFFSET_SEC = 8 * 3600; // Asia/Manila, UTC+8, no DST
+const int   DST_OFFSET_SEC = 0;
+
+// ─── COLORS (ILI9341) ──────────────────────────────────────────────────────
+#define COL_BG      ILI9341_BLACK
+#define COL_TEXT    ILI9341_WHITE
+#define COL_DIM     0x7BEF   // mid-grey
+#define COL_ACCENT  ILI9341_CYAN
+#define COL_OK      ILI9341_GREEN
+#define COL_WARN    ILI9341_YELLOW
+#define COL_ERR     ILI9341_RED
 
 HardwareSerial fingerSerial(2);
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fingerSerial);
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
 
 unsigned long lastSync = 0;
+unsigned long lastClockTick = 0;
+bool idleScreenActive = false;
+
+String lastPunchName = "";
+String lastPunchTime = "";
+
+// Step tracker: which stage of the scan pipeline we're in, for the top bar
+enum ScanStep { STEP_NONE = -1, STEP_SCAN = 0, STEP_MATCH = 1, STEP_VERIFY = 2, STEP_SYNC = 3 };
+const char* STEP_LABELS[4] = { "SCAN", "MATCH", "VERIFY", "SYNC" };
 
 size_t base64Decode(const String &input, uint8_t *output, size_t maxLen) {
   static const char* b64chars =
@@ -110,28 +95,116 @@ size_t base64Decode(const String &input, uint8_t *output, size_t maxLen) {
   return outLen;
 }
 
-void showStatus(const String& line1, const String& line2 = "") {
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println(line1);
-  display.setTextSize(1);
-  display.setCursor(0, 24);
-  display.println(line2);
-  display.display();
+// ─── DISPLAY HELPERS ──────────────────────────────────────────────────────
+
+String currentTimeString() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 0)) return "--:--:--";
+  char buf[16];
+  strftime(buf, sizeof(buf), "%H:%M:%S", &timeinfo);
+  return String(buf);
+}
+
+String currentDateString() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 0)) return "";
+  char buf[24];
+  strftime(buf, sizeof(buf), "%b %d, %Y", &timeinfo);
+  return String(buf);
+}
+
+// Top bar: WiFi status dot + live clock. Cheap to redraw, called often.
+void drawHeader() {
+  tft.fillRect(0, 0, 320, 22, COL_BG);
+  tft.drawFastHLine(0, 22, 320, COL_DIM);
+
+  tft.setTextSize(1);
+  tft.setTextColor(WiFi.status() == WL_CONNECTED ? COL_OK : COL_ERR);
+  tft.setCursor(6, 7);
+  tft.print(WiFi.status() == WL_CONNECTED ? "WiFi OK" : "WiFi --");
+
+  tft.setTextColor(COL_TEXT);
+  String t = currentTimeString();
+  tft.setCursor(320 - (t.length() * 6) - 6, 7);
+  tft.print(t);
+}
+
+// Step tracker bar under the header: SCAN > MATCH > VERIFY > SYNC
+void drawSteps(ScanStep active) {
+  int y = 30;
+  int colW = 320 / 4;
+  for (int i = 0; i < 4; i++) {
+    uint16_t col = (i == (int)active) ? COL_ACCENT : COL_DIM;
+    tft.fillRoundRect(i * colW + 6, y, colW - 12, 22, 4, (i == (int)active) ? COL_ACCENT : COL_BG);
+    tft.drawRoundRect(i * colW + 6, y, colW - 12, 22, 4, col);
+    tft.setTextSize(1);
+    tft.setTextColor((i == (int)active) ? ILI9341_BLACK : COL_DIM);
+    int textX = i * colW + 6 + ((colW - 12) - strlen(STEP_LABELS[i]) * 6) / 2;
+    tft.setCursor(textX, y + 7);
+    tft.print(STEP_LABELS[i]);
+  }
+}
+
+// Footer: last successful punch, small and dim so it doesn't compete
+// with the main message.
+void drawFooter() {
+  tft.fillRect(0, 224, 320, 16, COL_BG);
+  tft.drawFastHLine(0, 222, 320, COL_DIM);
+  tft.setTextSize(1);
+  tft.setTextColor(COL_DIM);
+  tft.setCursor(6, 227);
+  if (lastPunchName.length() == 0) {
+    tft.print("No punches yet this session");
+  } else {
+    tft.print("Last: " + lastPunchName + "  " + lastPunchTime);
+  }
+}
+
+// Main status area (between header/steps and footer). color tints the
+// big message so OK/warning/error are visually distinct, not just text.
+void showStatus(const String& line1, const String& line2 = "", uint16_t color = COL_TEXT, ScanStep step = STEP_NONE) {
+  idleScreenActive = false;
+  drawHeader();
+  drawSteps(step);
+
+  tft.fillRect(0, 58, 320, 160, COL_BG);
+  tft.setTextColor(color);
+  tft.setTextSize(3);
+  tft.setCursor(10, 90);
+  tft.print(line1);
+
+  if (line2.length() > 0) {
+    tft.setTextSize(2);
+    tft.setTextColor(COL_DIM);
+    tft.setCursor(10, 140);
+    tft.print(line2);
+  }
+
+  drawFooter();
+}
+
+// The idle "Ready" screen is drawn once, then only the clock in the header
+// ticks over every second - avoids full-screen redraw flicker while nobody
+// is scanning.
+void showIdleScreen() {
+  showStatus("Ready", "Place finger to scan", COL_ACCENT, STEP_NONE);
+  tft.setTextSize(1);
+  tft.setTextColor(COL_DIM);
+  tft.setCursor(10, 165);
+  tft.print(currentDateString());
+  idleScreenActive = true;
 }
 
 void setup() {
   Serial.begin(115200);
   delay(300);
 
-  Wire.begin(OLED_SDA, OLED_SCL);
-  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR)) {
-    Serial.println("OLED not found - check wiring/address (0x3C).");
-    while (true) delay(1000);
-  }
-  showStatus("Booting...", "Init sensor");
+  // Initialize SPI and TFT display
+  SPI.begin(18, 19, 23, TFT_CS);
+  tft.begin();
+  tft.setRotation(1);          // landscape
+  tft.fillScreen(ILI9341_BLACK);
+  showStatus("Booting...", "Init sensor", COL_TEXT);
 
   fingerSerial.setRxBufferSize(1024);
   fingerSerial.begin(57600, SERIAL_8N1, 16, 17);
@@ -139,7 +212,7 @@ void setup() {
 
   if (!finger.verifyPassword()) {
     Serial.println("Fingerprint sensor NOT found - check wiring/power.");
-    showStatus("Sensor ERROR", "Check wiring");
+    showStatus("Sensor ERROR", "Check wiring", COL_ERR);
     while (true) delay(1000);
   }
   Serial.println("Fingerprint sensor found.");
@@ -153,8 +226,18 @@ void setup() {
   Serial.println("records for this device, then resync from scratch.");
 
   connectWifi();
+
+  showStatus("Syncing time...", "", COL_TEXT);
+  configTime(TZ_OFFSET_SEC, DST_OFFSET_SEC, NTP_SERVER);
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo, 5000)) {
+    Serial.println("Time synced: " + currentDateString() + " " + currentTimeString());
+  } else {
+    Serial.println("NTP sync failed - clock will show placeholder time.");
+  }
+
   syncPendingTemplates();
-  showStatus("Ready", "Scan finger");
+  showIdleScreen();
 }
 
 void loop() {
@@ -165,77 +248,77 @@ void loop() {
   if (millis() - lastSync >= SYNC_INTERVAL_MS) {
     lastSync = millis();
     syncPendingTemplates();
-    showStatus("Ready", "Scan finger");
+    showIdleScreen();
+  }
+
+  // Tick the header clock once a second while idle, without a full redraw
+  if (idleScreenActive && millis() - lastClockTick >= 1000) {
+    lastClockTick = millis();
+    drawHeader();
   }
 
   int p = finger.getImage();
   if (p == FINGERPRINT_OK) {
+    showStatus("Reading print...", "", COL_TEXT, STEP_SCAN);
     p = finger.image2Tz(1);
     if (p == FINGERPRINT_OK) {
+      showStatus("Searching...", "", COL_TEXT, STEP_MATCH);
       p = finger.fingerFastSearch();
       if (p == FINGERPRINT_OK) {
         Serial.printf("Raw match: slot %d, confidence %d\n", finger.fingerID, finger.confidence);
 
         if (finger.confidence >= MIN_CONFIDENCE_THRESHOLD) {
           Serial.printf("ACCEPTED: Matched slot %d (confidence %d)\n", finger.fingerID, finger.confidence);
-          showStatus("Checking...", "");
+          showStatus("Verifying...", "", COL_TEXT, STEP_VERIFY);
           identifyAndPunch(finger.fingerID);
         } else {
           Serial.printf("REJECTED: Confidence too low (%d < %d)\n", finger.confidence, MIN_CONFIDENCE_THRESHOLD);
-          showStatus("Low quality", "Try again");
-          delay(1000);
-          showStatus("Ready", "Scan finger");
+          showStatus("Low quality", "Try again", COL_WARN, STEP_MATCH);
+          delay(1200);
+          showIdleScreen();
         }
       } else {
-        showStatus("Not recognized", "Try again");
-        delay(1000);
-        showStatus("Ready", "Scan finger");
+        showStatus("Not recognized", "Try again or resync", COL_WARN, STEP_MATCH);
+        delay(1200);
+        showIdleScreen();
       }
     }
   }
   delay(SCAN_LOOP_DELAY_MS);
 }
 
-// FIX D: wipe now clears BOTH the physical sensor AND the backend's belief
-// about what this device has synced. Order matters: wipe the sensor first
-// (so if WiFi/backend call fails, at least the sensor is in a known-empty
-// state and a retry of just the backend call is safe), then reset the
-// backend, then resync.
 void handleSerialCommands() {
   if (!Serial.available()) return;
   String cmd = Serial.readStringUntil('\n');
   cmd.trim();
   if (cmd.equalsIgnoreCase("wipe")) {
     Serial.println("Wiping fingerprint library...");
-    showStatus("Wiping...", "Please wait");
+    showStatus("Wiping...", "Please wait", COL_WARN);
     int wipeResult = finger.emptyDatabase();
     Serial.printf("emptyDatabase() returned %d (0 = OK)\n", wipeResult);
     if (wipeResult != FINGERPRINT_OK) {
-      showStatus("Wipe FAILED", "Check serial log");
+      showStatus("Wipe FAILED", "Check serial log", COL_ERR);
       return;
     }
 
-    showStatus("Resetting", "backend sync...");
+    showStatus("Resetting", "backend sync...", COL_WARN);
     bool backendOk = resetBackendSyncState();
     if (!backendOk) {
       Serial.println("WARNING: backend reset failed or unreachable.");
       Serial.println("Sensor is empty but backend still thinks it's synced -");
       Serial.println("pending-sync may report 0 pending. Fix WiFi/backend and");
       Serial.println("type 'wipe' again, or call reset-device-sync manually.");
-      showStatus("Backend reset", "FAILED - see log");
+      showStatus("Backend reset", "FAILED - see log", COL_ERR);
       delay(2000);
       return;
     }
 
-    showStatus("Wipe OK", "Resyncing...");
+    showStatus("Wipe OK", "Resyncing...", COL_OK);
     syncPendingTemplates();
-    showStatus("Ready", "Scan finger");
+    showIdleScreen();
   }
 }
 
-// FIX D support: tells the backend to forget this device's synced records,
-// so pending-sync correctly reports everything as pending again after a
-// physical wipe. See resetDeviceSync() in fingerprints.controller.js.
 bool resetBackendSyncState() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Cannot reset backend sync state - WiFi not connected");
@@ -260,7 +343,7 @@ bool resetBackendSyncState() {
 }
 
 void connectWifi() {
-  showStatus("WiFi", "Connecting...");
+  showStatus("WiFi", "Connecting...", COL_TEXT);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
@@ -271,18 +354,14 @@ void connectWifi() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print("WiFi connected, IP: ");
     Serial.println(WiFi.localIP());
-    showStatus("WiFi OK", WiFi.localIP().toString());
+    showStatus("WiFi OK", WiFi.localIP().toString(), COL_OK);
     delay(800);
   } else {
     Serial.println("WiFi connection failed, will retry.");
-    showStatus("WiFi FAILED", "Will retry...");
+    showStatus("WiFi FAILED", "Will retry...", COL_ERR);
   }
 }
 
-// FIX F support: drain any stray bytes sitting in the fingerprint sensor's
-// UART RX buffer, then give it a moment to settle. Called before AND after
-// each entry's sensor commands in syncPendingTemplates() so back-to-back
-// entries in the same batch don't intermittently fail.
 void flushAndSettleSensor(unsigned long settleMs) {
   while (fingerSerial.available()) fingerSerial.read();
   delay(settleMs);
@@ -291,7 +370,7 @@ void flushAndSettleSensor(unsigned long settleMs) {
 void syncPendingTemplates() {
   if (WiFi.status() != WL_CONNECTED) return;
 
-  showStatus("Syncing...", "Checking for new prints");
+  showStatus("Syncing...", "Checking for new prints", COL_TEXT, STEP_SYNC);
 
   HTTPClient http;
   String url = String(SERVER_URL) + "/api/device/fingerprints/pending-sync?device_id=" + DEVICE_ID;
@@ -322,12 +401,6 @@ void syncPendingTemplates() {
     String templateB64 = entry["template_data"].as<String>();
     String name = entry["name"].as<String>();
 
-    // FIX E: existing_local_slot is now ALWAYS present and backend-assigned
-    // - for a resync it's this device's own prior slot, for a first-time
-    // sync it's a freshly assigned one. There is no more "guess from local
-    // sensor state" fallback. If this field is ever missing, that means
-    // you're running this firmware against the OLD backend controller -
-    // update fingerprints.controller.js's pendingSync() first.
     if (entry["existing_local_slot"].isNull()) {
       Serial.printf("Skipping %s - backend did not assign a slot (is the backend updated?)\n", name.c_str());
       continue;
@@ -339,11 +412,8 @@ void syncPendingTemplates() {
       continue;
     }
 
-    showStatus("Syncing", name);
+    showStatus("Syncing", name, COL_TEXT, STEP_SYNC);
 
-    // FIX F: settle the sensor and clear any leftover UART bytes before
-    // starting this entry's DOWNLOAD command. Matters most for the 2nd+
-    // entry in a batch, right after the previous entry's verify-upload.
     flushAndSettleSensor(150);
 
     static uint8_t buf[FP_TEMPLATE_SIZE + 64];
@@ -360,9 +430,6 @@ void syncPendingTemplates() {
 
     if (!downloadTemplateBytes(1, buf, len)) {
       Serial.printf("Download to sensor failed for %s\n", name.c_str());
-      // FIX F: settle before the next loop iteration even on this failure
-      // path, so a rejected DOWNLOAD command doesn't leave the sensor in
-      // a bad state for the next entry.
       flushAndSettleSensor(150);
       continue;
     }
@@ -408,13 +475,10 @@ void syncPendingTemplates() {
       Serial.printf("register-synced did not confirm for %s - will retry next cycle\n", name.c_str());
     }
 
-    // FIX F: let the sensor settle and clear any stray UART bytes before
-    // starting the next entry's download command. Without this, back-to-back
-    // entries in the same batch intermittently fail storeModel/download.
     flushAndSettleSensor(300);
   }
 
-  showStatus("Sync done", String(pending.size()) + " checked");
+  showStatus("Sync done", String(pending.size()) + " checked", COL_OK, STEP_SYNC);
   delay(800);
 }
 
@@ -460,9 +524,9 @@ void identifyAndPunch(uint16_t sensorSlotId) {
 
   if (code != 200) {
     Serial.printf("identify failed, HTTP %d: %s\n", code, respBody.c_str());
-    showStatus("Not found", "Try again or resync");
+    showStatus("Not found", "Try again or resync", COL_ERR, STEP_VERIFY);
     delay(1500);
-    showStatus("Ready", "Scan finger");
+    showIdleScreen();
     return;
   }
 
@@ -475,7 +539,7 @@ void identifyAndPunch(uint16_t sensorSlotId) {
   String employeeId = respDoc["employee_id"].as<String>();
   String name = respDoc["name"].as<String>();
 
-  showStatus("Welcome", name);
+  showStatus("Welcome", name, COL_OK, STEP_VERIFY);
   punchAttendance(employeeId, name);
 }
 
@@ -495,15 +559,29 @@ void punchAttendance(const String& employeeId, const String& name) {
   http.end();
 
   Serial.printf("punch -> HTTP %d: %s\n", code, respBody.c_str());
-  if (code == 200 || code == 201) {
-    showStatus("Punched in!", name);
-  } else {
-    showStatus("Punch failed", "Check backend");
-  }
-  delay(1500);
-  showStatus("Ready", "Scan finger");
-}
 
+  if (code == 200 || code == 201) {
+    lastPunchName = name;
+    lastPunchTime = currentTimeString();
+    showStatus("Punched in!", name + "  " + lastPunchTime, COL_OK, STEP_SYNC);
+  } else {
+    // Try to pull a human-readable reason out of the backend's response
+    String reason = "Check backend";
+    StaticJsonDocument<256> errDoc;
+    if (!deserializeJson(errDoc, respBody)) {
+      const char* errMsg = errDoc["error"];
+      if (errMsg != nullptr) reason = String(errMsg);
+    }
+
+    if (code == 403 && reason.indexOf("No shift") >= 0) {
+      showStatus("No shift today", name, COL_WARN, STEP_SYNC);
+    } else {
+      showStatus("Punch failed", reason, COL_ERR, STEP_SYNC);
+    }
+  }
+  delay(1800);
+  showIdleScreen();
+}
 // ─── Raw template transfer ───────────────────────────────────────────────
 bool downloadTemplateBytes(uint8_t bufferNo, const uint8_t* buf, uint16_t len) {
   uint8_t cmdData[] = { FINGERPRINT_DOWNLOAD, bufferNo };
