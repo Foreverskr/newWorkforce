@@ -4,6 +4,16 @@ import { api } from '../lib/api';
 import { format } from 'date-fns';
 import * as XLSX from 'xlsx';
 
+// Builds a local YYYY-MM-DD string without going through UTC (toISOString()
+// converts to UTC first, which shows yesterday's date for users east of UTC
+// during their early-morning hours).
+function toISODate(d) {
+  const yr = d.getFullYear();
+  const mo = String(d.getMonth() + 1).padStart(2, '0');
+  const da = String(d.getDate()).padStart(2, '0');
+  return `${yr}-${mo}-${da}`;
+}
+
 // Handles Excel/Sheets date cells. Sheets store dates as plain serial numbers
 // with no timezone attached, so we parse that number directly (pure arithmetic,
 // no JS Date involved) — the only reliable way to avoid off-by-one shifts for
@@ -50,7 +60,7 @@ function normalizeImportTime(value) {
 
 function ManualModal({ employees, onClose, onSave }) {
   const [form, setForm] = useState({
-    employee_id: '', date: new Date().toISOString().split('T')[0],
+    employee_id: '', date: toISODate(new Date()),
     clock_in: '09:00', clock_out: '', status: 'present', notes: '',
   });
   const [saving, setSaving] = useState(false);
@@ -122,8 +132,8 @@ export default function AttendancePage({ onToast }) {
   const [employees, setEmployees] = useState([]);
   const [loading, setLoading] = useState(true);
   const [filters, setFilters] = useState({
-    start_date: new Date().toISOString().split('T')[0],
-    end_date: new Date().toISOString().split('T')[0],
+    start_date: toISODate(new Date()),
+    end_date: toISODate(new Date()),
     status: '', employee_id: '',
   });
   const [search, setSearch] = useState('');
@@ -339,7 +349,7 @@ export default function AttendancePage({ onToast }) {
                         {r.employees?.name || '—'}
                       </div>
                     </td>
-                    <td>{r.employees?.department || '—'}</td>
+                    <td>{r.employees?.department ? r.employees.department : '⚠️ MISSING'}</td>
                     <td className="mono">{r.date}</td>
                     <td className="mono" style={{ color: 'var(--green)' }}>{r.clock_in || '—'}</td>
                     <td className="mono" style={{ color: 'var(--accent)' }}>{r.clock_out || '—'}</td>

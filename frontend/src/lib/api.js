@@ -41,6 +41,7 @@ export const api = {
   // for 7+ consecutive working days — separate from driver inactivity below)
   checkEmployeeInactivity: () => request('/employees/check-inactivity', { method: 'POST' }),
   getEmployeeInactivityLogs: () => request('/employees/inactivity-logs'),
+  notifyInactiveEmployee: (id) => request(`/employees/${id}/notify-inactive`, { method: 'POST' }),
 
   // Fingerprint enrollment (primary + 2 backups per employee, captured by an
   // ESP32 + sensor terminal — see routes/fingerprints.routes.js)
@@ -82,6 +83,14 @@ export const api = {
     const qs = new URLSearchParams(params).toString();
     return request(`/analytics/summary${qs ? `?${qs}` : ''}`);
   },
+  getCutoffReport: (params = {}) => {
+    const qs = new URLSearchParams(params).toString();
+    return request(`/analytics/cutoff${qs ? `?${qs}` : ''}`);
+  },
+  getCutoffDetails: (params = {}) => {
+    const qs = new URLSearchParams(params).toString();
+    return request(`/analytics/cutoff/details${qs ? `?${qs}` : ''}`);
+  },
 
   // Shift templates (reusable shift definitions, e.g. "Morning Shift" 06:00-14:00)
   getShiftTemplates: () => request('/shift-templates'),
@@ -117,4 +126,25 @@ export const api = {
   reassignDriver: (body) => request('/employees/reassign-driver', { method: 'POST', body: JSON.stringify(body) }),
   getDriverReassignments: (date) => request(`/employees/reassignments${date ? `?date=${date}` : ''}`),
   deleteDriverReassignment: (id) => request(`/employees/reassignments/${id}`, { method: 'DELETE' }),
+
+  // Staffing requirements (how many of a position are needed for a given
+  // role/shift on a given date) + coverage (required vs. actually assigned)
+  getStaffingRequirements: (params = {}) => {
+    const qs = new URLSearchParams(params).toString();
+    return request(`/staffing-requirements${qs ? `?${qs}` : ''}`);
+  },
+  getCoverage: (params = {}) => {
+    const qs = new URLSearchParams(params).toString();
+    return request(`/staffing-requirements/coverage${qs ? `?${qs}` : ''}`);
+  },
+  createStaffingRequirement: (body) => request('/staffing-requirements', { method: 'POST', body: JSON.stringify(body) }),
+  createRecurringStaffingRequirement: (body) => request('/staffing-requirements/recurring', { method: 'POST', body: JSON.stringify(body) }),
+  updateStaffingRequirement: (id, body) => request(`/staffing-requirements/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
+  deleteStaffingRequirement: (id) => request(`/staffing-requirements/${id}`, { method: 'DELETE' }),
+  // ... existing code ...
+
+  deleteStaffingRequirement: (id) => request(`/staffing-requirements/${id}`, { method: 'DELETE' }),
+
+  // 🟢 ADD THIS LINE RIGHT HERE 🟢
+  getPositions: () => request('/positions'),
 };

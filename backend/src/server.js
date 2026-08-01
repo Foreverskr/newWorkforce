@@ -6,6 +6,8 @@ import cors from 'cors';
 import { notFoundHandler, errorHandler } from './middleware/errorHandler.js';
 import { requireAuth } from './middleware/authMiddleware.js';
 
+import positionsRoutes from './routes/positions.routes.js';
+import staffingRequirementsRoutes from './routes/staffingRequirements.routes.js';
 import authRoutes from './routes/auth.routes.js';
 import employeesRoutes from './routes/employees.routes.js';
 import leavesRoutes from './routes/leaves.routes.js';
@@ -40,6 +42,9 @@ app.use('/api/shift-templates', requireAuth, templateRouter);
 app.use('/api/schedule', requireAuth, scheduleRoutes);
 app.use('/api/drivers', requireAuth, driversRoutes);
 app.use('/api/analytics', requireAuth, analyticsRoutes);
+app.use('/api/positions', requireAuth, positionsRoutes); // <-- Added requireAuth
+app.use('/api/staffing-requirements', requireAuth, staffingRequirementsRoutes); // <-- I also added 
+
 
 app.use(notFoundHandler);
 app.use(errorHandler);

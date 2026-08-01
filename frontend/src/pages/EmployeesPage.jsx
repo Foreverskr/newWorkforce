@@ -1,8 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
-import { Search, Plus, Edit2, Trash2, Users, AlertTriangle, Fingerprint, X, Loader2, CheckCircle2 } from 'lucide-react';
+import { Search, Plus, Edit2, Trash2, Users, AlertTriangle, Fingerprint, X, Loader2, CheckCircle2, Mail } from 'lucide-react';
 import { api } from '../lib/api';
-
-const DEPARTMENTS = ['Engineering', 'Marketing', 'Sales', 'HR', 'Finance', 'Operations', 'Design', 'Product'];
 
 const FINGERPRINT_SLOTS = [
   { slot_label: 'primary', title: 'Primary Fingerprint' },
@@ -49,10 +47,7 @@ function EmployeeModal({ emp, onClose, onSave }) {
           </div>
           <div className="form-group">
             <label>Department</label>
-            <select value={form.department} onChange={set('department')}>
-              <option value="">Select…</option>
-              {DEPARTMENTS.map(d => <option key={d}>{d}</option>)}
-            </select>
+            <input value={form.department} onChange={set('department')} placeholder="Engineering" />
           </div>
           <div className="form-group">
             <label>Position</label>
@@ -92,7 +87,6 @@ function EmployeeModal({ emp, onClose, onSave }) {
 }
 
 // Polls a pending enrollment request until the ESP32 terminal reports back
-// (completed/failed), or the person gives up and closes/cancels it.
 function FingerprintSlotRow({ employeeId, slot, onChanged, onToast }) {
   const [request, setRequest] = useState(slot.request);
   const pollRef = useRef(null);
@@ -116,7 +110,7 @@ function FingerprintSlotRow({ employeeId, slot, onChanged, onToast }) {
         } else if (updated.status === 'failed') {
           onToast(updated.error_message || 'Enrollment failed on the device', 'error');
         }
-      } catch (e) { /* keep polling; a transient network blip shouldn't kill the UI */ }
+      } catch (e) { /* keep polling */ }
     }, 2000);
     return () => clearInterval(pollRef.current);
   }, [request?.id, request?.status]);
@@ -138,7 +132,7 @@ function FingerprintSlotRow({ employeeId, slot, onChanged, onToast }) {
 
   const remove = async () => {
     const slotTitle = slot.title || FINGERPRINT_SLOTS.find(s => s.slot_label === slot.slot_label)?.title || 'fingerprint';
-    if (!confirm(`Remove the ${slotTitle.toLowerCase()}? The employee will need to re-scan it.`)) return;
+    if (!confirm(`Remove the ${slotTitle.toLowerCase()}?`)) return;
     try {
       await api.deleteEmployeeFingerprint(employeeId, slot.fingerprint.id);
       onToast('Fingerprint removed', 'success');
@@ -208,8 +202,7 @@ function FingerprintModal({ emp, onClose, onToast }) {
         </div>
         <div style={{ padding: '4px 20px 8px' }}>
           <p className="text-dim text-sm" style={{ marginBottom: 8 }}>
-            One primary finger plus up to 2 backups (in case the primary won't scan). On "Enroll", the
-            employee scans their finger on the fingerprint terminal within a couple minutes.
+            One primary finger plus up to 2 backups.
           </p>
           {loading ? (
             <div className="loading"><div className="spinner" /> Loading…</div>
@@ -240,6 +233,7 @@ export default function EmployeesPage({ onToast }) {
   const [deptFilter, setDeptFilter] = useState('');
   const [modal, setModal] = useState(null); // null | 'add' | employee obj
   const [fingerprintTarget, setFingerprintTarget] = useState(null); // employee obj | null
+  const [notifying, setNotifying] = useState(null); // employee id currently sending, or null
 
   const load = async () => {
     setLoading(true);
@@ -271,6 +265,15 @@ export default function EmployeesPage({ onToast }) {
       setEmployees(e => e.filter(x => x.id !== id));
       onToast('Employee deleted', 'success');
     } catch(e) { onToast(e.message, 'error'); }
+  };
+
+  const notify = async (emp) => {
+    setNotifying(emp.id);
+    try {
+      await api.notifyInactiveEmployee(emp.id);
+      onToast(`Notification email sent to ${emp.name}`, 'success');
+    } catch (e) { onToast(e.message, 'error'); }
+    finally { setNotifying(null); }
   };
 
   const save = async (form) => {
@@ -353,9 +356,7 @@ export default function EmployeesPage({ onToast }) {
                       <div className="flex-center" style={{ gap: 8 }}>
                         <div className="avatar">{initials(e.name)}</div>
                         {e.name}
-                        {e.is_fleet_driver && (
-                          <span className="badge active" title="Fleet driver">Fleet</span>
-                        )}
+                        {/* 🟢 REMOVED THE FLEET BADGE HERE 🟢 */}
                       </div>
                     </td>
                     <td className="mono">{e.employee_id}</td>
@@ -372,6 +373,16 @@ export default function EmployeesPage({ onToast }) {
                     </td>
                     <td>
                       <div className="flex-center gap-2">
+                        {e.status === 'inactive' && (
+                          <button
+                            className="btn btn-icon btn-ghost btn-sm"
+                            onClick={() => notify(e)}
+                            disabled={notifying === e.id}
+                            title="Send inactivity notification email"
+                          >
+                            {notifying === e.id ? <Loader2 size={13} className="spin" /> : <Mail size={13} />}
+                          </button>
+                        )}
                         <button className="btn btn-icon btn-ghost btn-sm" onClick={() => setFingerprintTarget(e)} title="Manage fingerprints">
                           <Fingerprint size={13} />
                         </button>

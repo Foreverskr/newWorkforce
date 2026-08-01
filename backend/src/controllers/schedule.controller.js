@@ -1,23 +1,14 @@
 import { supabase } from '../config/supabase.js';
 import { handleError } from '../middleware/errorHandler.js';
 
-// Two tables: shift_templates (reusable, e.g. "Morning Shift" 06:00-14:00) and
-// shift_assignments (which employee has which template on which specific date —
-// one row per employee per day; UNIQUE(employee_id, date) prevents double-booking).
-// Recurring assignment ("Mon/Wed/Fri") is NOT stored as a recurrence rule — it's
-// expanded server-side into individual date rows via createRecurring below.
-// This keeps lookups simple (no rule evaluation) and lets each day be edited or
-// removed independently without touching a pattern that affects other days.
-//
-// NOTE: unrelated to employees.shift_start/shift_end, which is just a default
-// used only for the late/present clock-in check in attendance.controller.js —
-// this is the real roster.
+export function todayDateString(timeZone = 'Asia/Manila') {
+  return new Intl.DateTimeFormat('en-CA', { timeZone }).format(new Date());
+}
 
-// ── Shift templates ──
-
+// ── Shift templates (roles table) ──
 export async function listTemplates(req, res) {
   const { data, error } = await supabase
-    .from('shift_templates')
+    .from('roles')
     .select('*')
     .order('start_time', { ascending: true });
   if (error) return handleError(res, error);
@@ -30,7 +21,7 @@ export async function createTemplate(req, res) {
     return res.status(400).json({ error: 'name, start_time, and end_time are required' });
   }
   const { data, error } = await supabase
-    .from('shift_templates')
+    .from('roles')
     .insert([{ name, start_time, end_time, color: color || '#3b82f6' }])
     .select()
     .single();
@@ -41,7 +32,7 @@ export async function createTemplate(req, res) {
 export async function updateTemplate(req, res) {
   const { name, start_time, end_time, color } = req.body;
   const { data, error } = await supabase
-    .from('shift_templates')
+    .from('roles')
     .update({ name, start_time, end_time, color })
     .eq('id', req.params.id)
     .select()
@@ -51,23 +42,14 @@ export async function updateTemplate(req, res) {
 }
 
 export async function deleteTemplate(req, res) {
-  const { error } = await supabase.from('shift_templates').delete().eq('id', req.params.id);
+  const { error } = await supabase.from('roles').delete().eq('id', req.params.id);
   if (error) return handleError(res, error);
   res.json({ message: 'Shift template deleted' });
 }
 
 // ── Schedule (shift assignments) ──
-// A row can represent either a worked shift (shift_template_id set,
-// is_day_off false) or an explicit rest day / day off (shift_template_id
-// null, is_day_off true). This lets the UI distinguish "intentionally off"
-// from "just hasn't been scheduled yet" (no row at all), instead of both
-// looking like an empty cell.
-//
-// Requires this migration on the shift_assignments table:
-//   alter table shift_assignments add column is_day_off boolean not null default false;
-//   alter table shift_assignments alter column shift_template_id drop not null;
+const ASSIGNMENT_SELECT = '*, shift_templates:roles(name, start_time, end_time, color)';
 
-// GET assignments in a date range, optionally filtered by employee
 export async function getSchedule(req, res) {
   const { start_date, end_date, employee_id } = req.query;
   const start = start_date || new Date().toISOString().split('T')[0];
@@ -75,7 +57,7 @@ export async function getSchedule(req, res) {
 
   let query = supabase
     .from('shift_assignments')
-    .select('*, employees(name, employee_id, department), shift_templates(name, start_time, end_time, color)')
+    .select(ASSIGNMENT_SELECT)
     .gte('date', start)
     .lte('date', end)
     .order('date', { ascending: true });
@@ -83,22 +65,86 @@ export async function getSchedule(req, res) {
 
   const { data, error } = await query;
   if (error) return handleError(res, error);
-  res.json(data);
+  
+  // 🟢 GHOST BUSTER: Filter out any rows with invalid/null employee_id BEFORE fetching names
+  const validData = data.filter(a => a.employee_id && a.employee_id !== 'undefined' && a.employee_id !== 'null' && a.employee_id.trim() !== '');
+  
+  // 🟢 Fetch employee names separately (Expecting the ID stored in shift_assignments to be employees.id)
+  const employeeIds = [...new Set(validData.map(a => a.employee_id))];
+  let empMap = {};
+  if (employeeIds.length > 0) {
+    const { data: employees } = await supabase
+      .from('employees')
+      .select('id, name, employee_id, department, position')
+      .in('id', employeeIds);
+    empMap = Object.fromEntries((employees || []).map(e => [e.id, e]));
+  }
+
+  // Attach the employee data manually
+  const result = validData.map(a => ({
+    ...a,
+    employees: empMap[a.employee_id] || null
+  }));
+
+  res.json(result);
 }
 
-// POST single assignment — upsert so re-assigning the same employee/date just replaces it.
-// Pass is_day_off: true to mark an explicit rest day instead of a worked shift;
-// shift_template_id is ignored (stored as null) in that case.
-//
-// Assigning an actual working shift (dayOff false) is blocked if the employee
-// has an approved leave covering that date — otherwise a schedule change can
-// silently contradict an already-approved leave (see leaves.controller.js,
-// which syncs approved leave into shift_assignments as a rest day). Marking
-// a day off is always allowed since it can't conflict with a leave.
+// 🟢 STAFFING GUARD: Check that (a) a staffing_requirements row exists matching this
+// employee's position for this shift_template_id + date, and (b) it isn't already full.
+// Manual fetch + in-JS join, same pattern as staffingrequirements.controller.js — avoids
+// relying on PostgREST relationship embedding for position_id (no FK declared for it).
+async function checkStaffingCapacity({ shift_template_id, date, employeePosition, employee_id }) {
+  const { data: requirements, error: reqErr } = await supabase
+    .from('staffing_requirements')
+    .select('id, position_id, required_count')
+    .eq('shift_template_id', shift_template_id)
+    .eq('date', date);
+  if (reqErr) return { error: reqErr };
+
+  const posIds = [...new Set((requirements || []).map(r => r.position_id))];
+  let posMap = {};
+  if (posIds.length > 0) {
+    const { data: positions } = await supabase.from('positions').select('id, name').in('id', posIds);
+    posMap = Object.fromEntries((positions || []).map(p => [p.id, p.name]));
+  }
+
+  const matchingReq = (requirements || []).find(r => posMap[r.position_id] === employeePosition);
+  if (!matchingReq) {
+    return {
+      blocked: `No staffing requirement exists for position "${employeePosition}" on this shift for ${date} — cannot assign. Add a staffing requirement first, or check the employee's position.`
+    };
+  }
+
+  const { data: existingAssignments, error: countErr } = await supabase
+    .from('shift_assignments')
+    .select('employee_id')
+    .eq('role_id', shift_template_id)
+    .eq('date', date)
+    .eq('position', employeePosition)
+    .eq('is_day_off', false)
+    .neq('employee_id', employee_id);
+  if (countErr) return { error: countErr };
+
+  const assignedCount = (existingAssignments || []).length;
+  if (assignedCount >= matchingReq.required_count) {
+    return {
+      blocked: `Staffing requirement for "${employeePosition}" on this shift for ${date} is already full (${assignedCount}/${matchingReq.required_count}). Increase required_count or remove another assignment first.`
+    };
+  }
+
+  return { ok: true };
+}
+
 export async function createAssignment(req, res) {
   const { employee_id, shift_template_id, date, notes, is_day_off } = req.body;
   const dayOff = !!is_day_off;
-  if (!employee_id || !date || (!dayOff && !shift_template_id)) {
+
+  // 🟢 HARDENED VALIDATION: Block empty strings and "undefined"
+  if (!employee_id || employee_id === 'undefined' || employee_id === 'null' || employee_id.trim() === '') {
+    return res.status(400).json({ error: 'A valid employee_id is required.' });
+  }
+
+  if (!date || (!dayOff && !shift_template_id)) {
     return res.status(400).json({ error: 'employee_id, date, and (shift_template_id or is_day_off) are required' });
   }
 
@@ -115,38 +161,56 @@ export async function createAssignment(req, res) {
     if (conflict) {
       const empName = conflict.employees?.name || 'This employee';
       return res.status(409).json({
-        error: `${empName} is on approved ${conflict.type} leave from ${conflict.start_date} to ${conflict.end_date} — cannot assign a working shift on ${date} while that leave is active. Reject or delete the leave first if this was a mistake.`,
+        error: `${empName} is on approved ${conflict.type} leave from ${conflict.start_date} to ${conflict.end_date} — cannot assign a working shift on ${date} while that leave is active.`,
       });
     }
+  }
+
+  let employeePosition = null;
+  if (!dayOff) {
+    const { data: empData } = await supabase
+      .from('employees')
+      .select('position')
+      .eq('id', employee_id)
+      .single();
+    employeePosition = empData?.position || null;
+  }
+
+  if (!dayOff && !employeePosition) {
+    return res.status(400).json({
+      error: `Cannot assign shift. The employee does not have a Position set. Please set their position in Employee Management first.`
+    });
+  }
+
+  // 🟢 STAFFING GUARD: enforce position match + capacity against staffing_requirements
+  if (!dayOff) {
+    const { error: staffingErr, blocked } = await checkStaffingCapacity({
+      shift_template_id,
+      date,
+      employeePosition,
+      employee_id,
+    });
+    if (staffingErr) return handleError(res, staffingErr);
+    if (blocked) return res.status(409).json({ error: blocked });
   }
 
   const { data, error } = await supabase
     .from('shift_assignments')
     .upsert([{
       employee_id,
-      shift_template_id: dayOff ? null : shift_template_id,
+      role_id: dayOff ? null : shift_template_id,
+      position: dayOff ? null : employeePosition,
       date,
       notes,
       is_day_off: dayOff,
       updated_at: new Date().toISOString(),
     }], { onConflict: 'employee_id,date' })
-    .select('*, employees(name, employee_id, department), shift_templates(name, start_time, end_time, color)')
+    .select(ASSIGNMENT_SELECT)
     .single();
   if (error) return handleError(res, error);
   res.status(201).json(data);
 }
 
-// POST recurring assignment — expands a weekday pattern over a date range into
-// individual shift_assignments rows. e.g. days_of_week: [1,3,5] = Mon/Wed/Fri
-// (0=Sun ... 6=Sat). Existing assignments on matching dates are overwritten.
-// Pass is_day_off: true to mark those weekdays as recurring rest days
-// (e.g. days_of_week: [0,6] to give an employee every Sat/Sun off) instead
-// of assigning a shift template.
-//
-// When assigning a working shift (dayOff false), any candidate date that
-// falls inside an approved leave for this employee is silently skipped
-// (not overwritten) and reported back in `skipped` rather than failing the
-// whole batch — same reasoning as the single-assignment guard above.
 export async function createRecurring(req, res) {
   const { employee_id, shift_template_id, start_date, end_date, days_of_week, notes, is_day_off } = req.body;
   const dayOff = !!is_day_off;
@@ -180,7 +244,6 @@ export async function createRecurring(req, res) {
       .gte('end_date', start_date);
     if (leaveErr) return handleError(res, leaveErr);
     overlappingLeaves = leaveRows || [];
-
     const isOnApprovedLeave = (d) => overlappingLeaves.some(l => l.start_date <= d && d <= l.end_date);
     skipped = candidateDates.filter(isOnApprovedLeave);
     usableDates = candidateDates.filter(d => !isOnApprovedLeave(d));
@@ -188,17 +251,92 @@ export async function createRecurring(req, res) {
 
   if (usableDates.length === 0) {
     const empName = overlappingLeaves[0]?.employees?.name || 'This employee';
-    const leaveDescriptions = overlappingLeaves
-      .map(l => `${l.type} leave (${l.start_date} to ${l.end_date})`)
-      .join(', ');
+    const leaveDescriptions = overlappingLeaves.map(l => `${l.type} leave (${l.start_date} to ${l.end_date})`).join(', ');
     return res.status(400).json({
-      error: `${empName} is on approved leave for every matching date — ${leaveDescriptions}. Reject or delete the leave first if this was a mistake.`,
+      error: `${empName} is on approved leave for every matching date — ${leaveDescriptions}.`
     });
+  }
+
+  let employeePosition = null;
+  if (!dayOff) {
+    const { data: empData } = await supabase
+      .from('employees')
+      .select('position')
+      .eq('id', employee_id)
+      .single();
+    employeePosition = empData?.position || null;
+    if (!employeePosition) {
+      return res.status(400).json({ error: `Cannot assign recurring shift. Employee has no Position set.` });
+    }
+  }
+
+  // 🟢 STAFFING GUARD: batched position-match + capacity check across usableDates
+  let staffingSkipped = [];
+  if (!dayOff) {
+    const { data: requirements, error: reqErr } = await supabase
+      .from('staffing_requirements')
+      .select('id, position_id, required_count, date')
+      .eq('shift_template_id', shift_template_id)
+      .in('date', usableDates);
+    if (reqErr) return handleError(res, reqErr);
+
+    const posIds = [...new Set((requirements || []).map(r => r.position_id))];
+    let posMap = {};
+    if (posIds.length > 0) {
+      const { data: positions } = await supabase.from('positions').select('id, name').in('id', posIds);
+      posMap = Object.fromEntries((positions || []).map(p => [p.id, p.name]));
+    }
+
+    // one matching requirement per date, for this employee's position
+    const reqByDate = {};
+    for (const r of requirements || []) {
+      if (posMap[r.position_id] === employeePosition) reqByDate[r.date] = r;
+    }
+
+    const { data: existingAssignments, error: countErr } = await supabase
+      .from('shift_assignments')
+      .select('employee_id, date')
+      .eq('role_id', shift_template_id)
+      .eq('position', employeePosition)
+      .eq('is_day_off', false)
+      .in('date', usableDates)
+      .neq('employee_id', employee_id);
+    if (countErr) return handleError(res, countErr);
+
+    const countByDate = {};
+    for (const a of existingAssignments || []) {
+      countByDate[a.date] = (countByDate[a.date] || 0) + 1;
+    }
+
+    const stillUsable = [];
+    for (const d of usableDates) {
+      const req = reqByDate[d];
+      if (!req) {
+        staffingSkipped.push({ date: d, reason: `No staffing requirement for position "${employeePosition}"` });
+        continue;
+      }
+      const assigned = countByDate[d] || 0;
+      if (assigned >= req.required_count) {
+        staffingSkipped.push({ date: d, reason: `Staffing requirement full (${assigned}/${req.required_count})` });
+        continue;
+      }
+      stillUsable.push(d);
+    }
+    usableDates = stillUsable;
+
+    if (usableDates.length === 0) {
+      return res.status(400).json({
+        error: `No dates available — every matching date is blocked by staffing requirements.`,
+        skipped_leave: skipped,
+        skipped_staffing: staffingSkipped,
+      });
+    }
   }
 
   const records = usableDates.map(date => ({
     employee_id,
-    shift_template_id: dayOff ? null : shift_template_id,
+    role_id: dayOff ? null : shift_template_id,
+    position: dayOff ? null : employeePosition,
     date,
     notes: notes || null,
     is_day_off: dayOff,
@@ -208,12 +346,11 @@ export async function createRecurring(req, res) {
   const { data, error } = await supabase
     .from('shift_assignments')
     .upsert(records, { onConflict: 'employee_id,date' })
-    .select('*, employees(name, employee_id, department), shift_templates(name, start_time, end_time, color)');
+    .select(ASSIGNMENT_SELECT);
   if (error) return handleError(res, error);
-  res.status(201).json({ created: data.length, skipped, assignments: data });
+  res.status(201).json({ created: data.length, skipped, skipped_staffing: staffingSkipped, assignments: data });
 }
 
-// DELETE a single assignment (e.g. remove one day from a recurring block)
 export async function deleteAssignment(req, res) {
   const { error } = await supabase.from('shift_assignments').delete().eq('id', req.params.id);
   if (error) return handleError(res, error);

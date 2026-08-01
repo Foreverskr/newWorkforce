@@ -1,19 +1,13 @@
 import { useState, useEffect, useMemo } from 'react';
-import { Calendar, Plus, Trash2, Edit2, Repeat, Clock, Users, AlertTriangle, UserCheck, Truck } from 'lucide-react';
+import { Calendar, Plus, Trash2, Clock, AlertTriangle, Truck, Users, UserCheck, ClipboardList, Edit2, CheckCircle2, Filter } from 'lucide-react';
 import { api } from '../lib/api';
 
-const WEEKDAYS = [
-  { value: 1, label: 'Mon' },
-  { value: 2, label: 'Tue' },
-  { value: 3, label: 'Wed' },
-  { value: 4, label: 'Thu' },
-  { value: 5, label: 'Fri' },
-  { value: 6, label: 'Sat' },
-  { value: 0, label: 'Sun' },
-];
-
+// ─── Date Helpers ──────────────────────────────────────────────────────────────
 function toISODate(d) {
-  return d.toISOString().split('T')[0];
+  const yr = d.getFullYear();
+  const mo = String(d.getMonth() + 1).padStart(2, '0');
+  const da = String(d.getDate()).padStart(2, '0');
+  return `${yr}-${mo}-${da}`;
 }
 
 function startOfWeek(d) {
@@ -33,6 +27,13 @@ function formatTime(t) {
   return `${displayHour}:${m} ${period}`;
 }
 
+function StatusBadge({ status, gap }) {
+  if (status === 'full') return <span className="badge active" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><CheckCircle2 size={12} /> Full</span>;
+  if (status === 'understaffed') return <span className="badge inactive" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: 'var(--danger, #ef4444)' }}><AlertTriangle size={12} /> Short {gap}</span>;
+  return <span className="badge" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>+{Math.abs(gap)} over</span>;
+}
+
+// ─── Sub-Components ─────────────────────────────────────────────────────────────
 function ShiftTemplateModal({ templates, onClose, onSave, onDelete, onToast }) {
   const empty = { name: '', start_time: '09:00', end_time: '18:00', color: '#3b82f6' };
   const [form, setForm] = useState(empty);
@@ -50,498 +51,162 @@ function ShiftTemplateModal({ templates, onClose, onSave, onDelete, onToast }) {
   const save = async () => {
     if (!form.name || !form.start_time || !form.end_time) return;
     setSaving(true);
-    try {
-      await onSave(editingId, form);
-      cancelEdit();
-    } catch (e) { onToast(e.message, 'error'); }
+    try { await onSave(editingId, form); cancelEdit(); } 
+    catch (e) { onToast(e.message, 'error'); } 
     finally { setSaving(false); }
   };
 
   const del = async (t) => {
-    if (!confirm(`Delete "${t.name}"? Any assignments using it will lose their shift reference.`)) return;
-    try { await onDelete(t.id); }
+    if (!confirm(`Delete "${t.name}"?`)) return;
+    try { await onDelete(t.id); } 
     catch (e) { onToast(e.message, 'error'); }
   };
 
   return (
     <div className="modal-overlay">
       <div className="modal">
-        <div className="modal-header">
-          <span className="modal-title">Shift Templates</span>
-          <button className="btn btn-icon btn-ghost" onClick={onClose}>✕</button>
+        <div className="modal-header"><span className="modal-title">Shift Templates</span><button className="btn btn-icon btn-ghost" onClick={onClose}>✕</button></div>
+        <div className="table-wrap" style={{ marginBottom: 16 }}>
+          <table><thead><tr><th>Name</th><th>Start</th><th>End</th><th></th></tr></thead>
+            <tbody>{templates.map(t => (
+              <tr key={t.id}><td><span className="flex-center" style={{ gap: 8 }}><span style={{ width: 10, height: 10, borderRadius: '50%', background: t.color || '#3b82f6' }} /> {t.name}</span></td>
+                <td className="mono text-sm">{formatTime(t.start_time)}</td><td className="mono text-sm">{formatTime(t.end_time)}</td>
+                <td><div className="flex-center gap-2"><button className="btn btn-icon btn-ghost btn-sm" onClick={() => startEdit(t)}><Clock size={13} /></button><button className="btn btn-icon btn-danger btn-sm" onClick={() => del(t)}><Trash2 size={13} /></button></div></td>
+              </tr>
+            ))}</tbody></table>
         </div>
-
-        {templates.length > 0 && (
-          <div className="table-wrap" style={{ marginBottom: 16 }}>
-            <table>
-              <thead>
-                <tr><th>Name</th><th>Start</th><th>End</th><th></th></tr>
-              </thead>
-              <tbody>
-                {templates.map(t => (
-                  <tr key={t.id}>
-                    <td>
-                      <span className="flex-center" style={{ gap: 8 }}>
-                        <span style={{ width: 10, height: 10, borderRadius: '50%', background: t.color || '#3b82f6', display: 'inline-block' }} />
-                        {t.name}
-                      </span>
-                    </td>
-                    <td className="mono text-sm">{formatTime(t.start_time)}</td>
-                    <td className="mono text-sm">{formatTime(t.end_time)}</td>
-                    <td>
-                      <div className="flex-center gap-2">
-                        <button className="btn btn-icon btn-ghost btn-sm" onClick={() => startEdit(t)} title="Edit"><Edit2 size={13} /></button>
-                        <button className="btn btn-icon btn-danger btn-sm" onClick={() => del(t)} title="Delete"><Trash2 size={13} /></button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-
         <div className="form-grid">
-          <div className="form-group full">
-            <label>{editingId ? 'Edit template' : 'New template name'}</label>
-            <input value={form.name} onChange={set('name')} placeholder="Morning Shift" />
-          </div>
-          <div className="form-group">
-            <label>Start time</label>
-            <input type="time" value={form.start_time} onChange={set('start_time')} />
-          </div>
-          <div className="form-group">
-            <label>End time</label>
-            <input type="time" value={form.end_time} onChange={set('end_time')} />
-          </div>
-          <div className="form-group">
-            <label>Color</label>
-            <input type="color" value={form.color} onChange={set('color')} style={{ padding: 2, height: 38 }} />
-          </div>
+          <div className="form-group full"><label>Name</label><input value={form.name} onChange={set('name')} placeholder="Morning Shift" /></div>
+          <div className="form-group"><label>Start</label><input type="time" value={form.start_time} onChange={set('start_time')} /></div>
+          <div className="form-group"><label>End</label><input type="time" value={form.end_time} onChange={set('end_time')} /></div>
+          <div className="form-group"><label>Color</label><input type="color" value={form.color} onChange={set('color')} style={{ padding: 2, height: 38 }} /></div>
         </div>
-
-        <div className="modal-footer">
-          {editingId && <button className="btn btn-ghost" onClick={cancelEdit}>Cancel edit</button>}
-          <button className="btn btn-primary" onClick={save} disabled={saving || !form.name}>
-            {saving ? 'Saving…' : editingId ? 'Update Template' : 'Add Template'}
-          </button>
-        </div>
+        <div className="modal-footer">{editingId && <button className="btn btn-ghost" onClick={cancelEdit}>Cancel</button>}<button className="btn btn-primary" onClick={save} disabled={saving || !form.name}>{saving ? 'Saving…' : editingId ? 'Update' : 'Add'}</button></div>
       </div>
     </div>
   );
 }
 
 function AssignShiftModal({ employees, templates, onClose, onAssign, onAssignRecurring, onToast }) {
-  const [mode, setMode] = useState('single'); // 'single' | 'recurring'
-  const [entryType, setEntryType] = useState(templates.length === 0 ? 'dayoff' : 'shift'); // 'shift' | 'dayoff'
+  const [mode, setMode] = useState('single');
+  const [entryType, setEntryType] = useState(templates.length === 0 ? 'dayoff' : 'shift');
   const today = toISODate(new Date());
-  const [form, setForm] = useState({
-    employee_id: employees[0]?.id || '',
-    shift_template_id: templates[0]?.id || '',
-    date: today,
-    start_date: today,
-    end_date: today,
-    days_of_week: [1, 2, 3, 4, 5],
-    notes: '',
-  });
+  const [form, setForm] = useState({ employee_id: employees[0]?.id || '', shift_template_id: templates[0]?.id || '', date: today, start_date: today, end_date: today, days_of_week: [1, 2, 3, 4, 5], notes: '' });
   const [saving, setSaving] = useState(false);
-  const [autoRestDays, setAutoRestDays] = useState(true); // fill unselected weekdays as rest days (recurring + shift only)
   const set = k => e => setForm(f => ({ ...f, [k]: e.target.value }));
-
-  const toggleDay = (d) => {
-    setForm(f => ({
-      ...f,
-      days_of_week: f.days_of_week.includes(d) ? f.days_of_week.filter(x => x !== d) : [...f.days_of_week, d],
-    }));
-  };
-
+  const toggleDay = (d) => setForm(f => ({ ...f, days_of_week: f.days_of_week.includes(d) ? f.days_of_week.filter(x => x !== d) : [...f.days_of_week, d] }));
   const isDayOff = entryType === 'dayoff';
-  const fillsRestDays = mode === 'recurring' && !isDayOff && autoRestDays;
-  const restComplementDays = fillsRestDays ? [0, 1, 2, 3, 4, 5, 6].filter(d => !form.days_of_week.includes(d)) : [];
 
   const submit = async () => {
     if (!form.employee_id) return onToast('Select an employee', 'error');
-    if (!isDayOff && !form.shift_template_id) return onToast('Select an employee and a shift', 'error');
+    if (!isDayOff && !form.shift_template_id) return onToast('Select a shift', 'error');
     setSaving(true);
     try {
-      if (mode === 'single') {
-        await onAssign({
-          employee_id: form.employee_id,
-          shift_template_id: isDayOff ? null : form.shift_template_id,
-          date: form.date,
-          notes: form.notes || null,
-          is_day_off: isDayOff,
-        });
-        onToast(isDayOff ? 'Rest day set' : 'Shift assigned', 'success');
-      } else {
-        if (form.days_of_week.length === 0) return onToast('Pick at least one day of the week', 'error');
-        const result = await onAssignRecurring({
-          employee_id: form.employee_id,
-          shift_template_id: isDayOff ? null : form.shift_template_id,
-          start_date: form.start_date,
-          end_date: form.end_date,
-          days_of_week: form.days_of_week,
-          notes: form.notes || null,
-          is_day_off: isDayOff,
-        });
-        let restCreated = 0;
-        if (restComplementDays.length > 0) {
-          const restResult = await onAssignRecurring({
-            employee_id: form.employee_id,
-            shift_template_id: null,
-            start_date: form.start_date,
-            end_date: form.end_date,
-            days_of_week: restComplementDays,
-            notes: null,
-            is_day_off: true,
-          });
-          restCreated = restResult.created;
-        }
-        const skippedCount = (result.skipped || []).length;
-        const parts = [];
-        parts.push(`${result.created} ${isDayOff ? 'rest day(s)' : 'shift(s)'} assigned`);
-        if (restCreated > 0) parts.push(`${restCreated} rest day(s) assigned`);
-        onToast(parts.join(' + '), 'success');
-        if (skippedCount > 0) {
-          const empName = employees.find(e => e.id === form.employee_id)?.name || 'This employee';
-          onToast(
-            `${empName} is on approved leave, so ${skippedCount} date(s) were skipped: ${result.skipped.join(', ')}`,
-            'error'
-          );
-        }
+      if (mode === 'single') await onAssign({ employee_id: form.employee_id, shift_template_id: isDayOff ? null : form.shift_template_id, date: form.date, notes: form.notes || null, is_day_off: isDayOff });
+      else {
+        if (form.days_of_week.length === 0) return onToast('Pick at least one day', 'error');
+        await onAssignRecurring({ employee_id: form.employee_id, shift_template_id: isDayOff ? null : form.shift_template_id, start_date: form.start_date, end_date: form.end_date, days_of_week: form.days_of_week, notes: form.notes || null, is_day_off: isDayOff });
       }
+      onToast(isDayOff ? 'Rest day set' : 'Shift assigned', 'success');
       onClose();
-    } catch (e) { onToast(e.message, 'error'); }
+    } catch (e) { onToast(e.message, 'error'); } 
     finally { setSaving(false); }
   };
 
   return (
     <div className="modal-overlay">
       <div className="modal">
-        <div className="modal-header">
-          <span className="modal-title">Assign Shift</span>
-          <button className="btn btn-icon btn-ghost" onClick={onClose}>✕</button>
-        </div>
-
-        <div className="flex-center gap-2" style={{ marginBottom: 12 }}>
-          <button className={`btn btn-sm ${mode === 'single' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setMode('single')}>
-            <Calendar size={13} /> Single date
-          </button>
-          <button className={`btn btn-sm ${mode === 'recurring' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setMode('recurring')}>
-            <Repeat size={13} /> Recurring
-          </button>
-        </div>
-
-        <div className="flex-center gap-2" style={{ marginBottom: 16 }}>
-          <button
-            className={`btn btn-sm ${entryType === 'shift' ? 'btn-primary' : 'btn-ghost'}`}
-            onClick={() => setEntryType('shift')}
-            disabled={templates.length === 0}
-            title={templates.length === 0 ? 'Add a shift template first' : undefined}
-          >
-            <Clock size={13} /> Working shift
-          </button>
-          <button className={`btn btn-sm ${entryType === 'dayoff' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setEntryType('dayoff')}>
-            Rest day / day off
-          </button>
-        </div>
-
+        <div className="modal-header"><span className="modal-title">Assign Shift</span><button className="btn btn-icon btn-ghost" onClick={onClose}>✕</button></div>
+        <div className="flex-center gap-2" style={{ marginBottom: 12 }}><button className={`btn btn-sm ${mode === 'single' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setMode('single')}><Calendar size={13} /> Single</button><button className={`btn btn-sm ${mode === 'recurring' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setMode('recurring')}><Clock size={13} /> Recurring</button></div>
+        <div className="flex-center gap-2" style={{ marginBottom: 16 }}><button className={`btn btn-sm ${entryType === 'shift' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setEntryType('shift')} disabled={templates.length === 0}><Clock size={13} /> Shift</button><button className={`btn btn-sm ${entryType === 'dayoff' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setEntryType('dayoff')}>Rest day</button></div>
         <div className="form-grid">
-          <div className="form-group full">
-            <label>Employee</label>
-            <select value={form.employee_id} onChange={set('employee_id')}>
-              {employees.map(e => <option key={e.id} value={e.id}>{e.name} ({e.employee_id})</option>)}
-            </select>
-          </div>
-          {isDayOff ? (
-            <div className="form-group full">
-              <p className="text-dim text-sm">
-                This will mark the selected date(s) as an explicit rest day — no shift template needed. It'll show up on the schedule so it's clear the day off was intentional, not just unscheduled.
-              </p>
-            </div>
-          ) : (
-            <div className="form-group full">
-              <label>Shift template</label>
-              <select value={form.shift_template_id} onChange={set('shift_template_id')}>
-                {templates.map(t => <option key={t.id} value={t.id}>{t.name} — {formatTime(t.start_time)} to {formatTime(t.end_time)}</option>)}
-              </select>
-            </div>
+          <div className="form-group full"><label>Employee</label><select value={form.employee_id} onChange={set('employee_id')}>{employees.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}</select></div>
+          {!isDayOff && <div className="form-group full"><label>Shift template</label><select value={form.shift_template_id} onChange={set('shift_template_id')}>{templates.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select></div>}
+          {mode === 'single' ? (<div className="form-group full"><label>Date</label><input type="date" value={form.date} onChange={set('date')} /></div>) : (
+            <><div className="form-group"><label>Start</label><input type="date" value={form.start_date} onChange={set('start_date')} /></div><div className="form-group"><label>End</label><input type="date" value={form.end_date} onChange={set('end_date')} /></div><div className="form-group full"><label>Repeat on</label><div className="flex-center gap-2" style={{ flexWrap: 'wrap' }}>{[1,2,3,4,5,6,0].map(d => <button key={d} type="button" className={`btn btn-sm ${form.days_of_week.includes(d) ? 'btn-primary' : 'btn-ghost'}`} onClick={() => toggleDay(d)}>{['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d]}</button>)}</div></div></>
           )}
-
-          {mode === 'single' ? (
-            <div className="form-group full">
-              <label>Date</label>
-              <input type="date" value={form.date} onChange={set('date')} />
-            </div>
-          ) : (
-            <>
-              <div className="form-group">
-                <label>Start date</label>
-                <input type="date" value={form.start_date} onChange={set('start_date')} />
-              </div>
-              <div className="form-group">
-                <label>End date</label>
-                <input type="date" value={form.end_date} onChange={set('end_date')} />
-              </div>
-              <div className="form-group full">
-                <label>Repeat on</label>
-                <div className="flex-center gap-2" style={{ flexWrap: 'wrap' }}>
-                  {WEEKDAYS.map(d => (
-                    <button
-                      key={d.value}
-                      type="button"
-                      className={`btn btn-sm ${form.days_of_week.includes(d.value) ? 'btn-primary' : 'btn-ghost'}`}
-                      onClick={() => toggleDay(d.value)}
-                    >
-                      {d.label}
-                    </button>
-                  ))}
-                </div>
-              </div>
-              {!isDayOff && (
-                <div className="form-group full">
-                  <label className="flex-center" style={{ gap: 8, cursor: 'pointer' }}>
-                    <input
-                      type="checkbox"
-                      checked={autoRestDays}
-                      onChange={e => setAutoRestDays(e.target.checked)}
-                      style={{ width: 'auto' }}
-                    />
-                    Mark the other days as rest day
-                  </label>
-                  <p className="text-dim text-sm" style={{ marginTop: 4 }}>
-                    {autoRestDays && restComplementDays.length > 0
-                      ? `${restComplementDays.map(d => WEEKDAYS.find(w => w.value === d)?.label).join(', ')} will be set as rest days in this same date range — no separate step needed.`
-                      : autoRestDays
-                      ? 'All 7 days are selected as working days, so there are no other days to mark off.'
-                      : 'Unselected days will be left as-is (no shift, no rest day recorded).'}
-                  </p>
-                </div>
-              )}
-            </>
-          )}
-
-          <div className="form-group full">
-            <label>Notes (optional)</label>
-            <input value={form.notes} onChange={set('notes')} placeholder="e.g. covering for training day" />
-          </div>
+          <div className="form-group full"><label>Notes</label><input value={form.notes} onChange={set('notes')} placeholder="Optional" /></div>
         </div>
-
-        <div className="modal-footer">
-          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
-          <button className="btn btn-primary" onClick={submit} disabled={saving}>
-            {saving ? 'Saving…' : isDayOff ? 'Set Rest Day' : 'Assign Shift'}
-          </button>
-        </div>
+        <div className="modal-footer"><button className="btn btn-ghost" onClick={onClose}>Cancel</button><button className="btn btn-primary" onClick={submit} disabled={saving}>{saving ? 'Saving…' : 'Assign'}</button></div>
       </div>
     </div>
   );
 }
 
+// ─── Driver Availability Panel ──────────────────────────────────────────────────
 function ReplacementModal({ absentDriver, date, onClose, onAssigned, onToast }) {
   const [available, setAvailable] = useState([]);
   const [loading, setLoading] = useState(true);
   const [assigningId, setAssigningId] = useState(null);
-
   useEffect(() => {
-    (async () => {
-      try { setAvailable(await api.getAvailableDrivers(date, absentDriver.id)); }
-      catch (e) { onToast(e.message, 'error'); }
-      finally { setLoading(false); }
-    })();
+    (async () => { try { setAvailable(await api.getAvailableDrivers(date, absentDriver.id)); } catch (e) { onToast(e.message, 'error'); } finally { setLoading(false); } })();
   }, []);
-
   const assign = async (replacement) => {
     setAssigningId(replacement.id);
-    try {
-      await api.reassignDriver({
-        date,
-        original_employee_id: absentDriver.id,
-        replacement_employee_id: replacement.id,
-      });
-      onToast(`${replacement.name} assigned to cover ${absentDriver.name}'s shift`, 'success');
-      onAssigned();
-      onClose();
-    } catch (e) { onToast(e.message, 'error'); }
+    try { await api.reassignDriver({ date, original_employee_id: absentDriver.id, replacement_employee_id: replacement.id }); onToast(`${replacement.name} assigned to cover`, 'success'); onAssigned(); onClose(); } 
+    catch (e) { onToast(e.message, 'error'); } 
     finally { setAssigningId(null); }
   };
-
   return (
     <div className="modal-overlay">
       <div className="modal">
-        <div className="modal-header">
-          <span className="modal-title">Find Replacement — {absentDriver.name}</span>
-          <button className="btn btn-icon btn-ghost" onClick={onClose}>✕</button>
-        </div>
+        <div className="modal-header"><span className="modal-title">Find Replacement</span><button className="btn btn-icon btn-ghost" onClick={onClose}>✕</button></div>
         <div style={{ padding: '0 4px' }}>
-          {loading ? (
-            <div className="loading"><div className="spinner" /> Checking available drivers…</div>
-          ) : available.length === 0 ? (
-            <div className="empty-state"><Users size={32} /><p>No other fleet drivers are clocked in on {date}</p></div>
-          ) : (
-            <div className="table-wrap">
-              <table>
-                <thead>
-                  <tr><th>Name</th><th>Employee ID</th><th>Department</th><th></th></tr>
-                </thead>
-                <tbody>
-                  {available.map(d => (
-                    <tr key={d.id}>
-                      <td>{d.name}</td>
-                      <td className="mono">{d.employee_id}</td>
-                      <td className="text-muted">{d.department || '—'}</td>
-                      <td>
-                        <button className="btn btn-primary btn-sm" onClick={() => assign(d)} disabled={assigningId === d.id}>
-                          {assigningId === d.id ? 'Assigning…' : 'Assign'}
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+          {loading ? <div className="loading"><div className="spinner" /> Loading...</div> : available.length === 0 ? <div className="empty-state"><Users size={32} /><p>No other drivers available</p></div> : (
+            <div className="table-wrap"><table><thead><tr><th>Name</th><th></th></tr></thead><tbody>{available.map(d => <tr key={d.id}><td>{d.name}</td><td><button className="btn btn-primary btn-sm" onClick={() => assign(d)} disabled={assigningId === d.id}>{assigningId === d.id ? '...' : 'Assign'}</button></td></tr>)}</tbody></table></div>
           )}
         </div>
-        <div className="modal-footer">
-          <button className="btn btn-ghost" onClick={onClose}>Close</button>
-        </div>
+        <div className="modal-footer"><button className="btn btn-ghost" onClick={onClose}>Close</button></div>
       </div>
     </div>
   );
 }
 
-// Fleet driver roster + coverage for a single day. Deliberately date-scoped
-// rather than tied to the week range above it — availability and clock-in
-// status are a daily concept, not a weekly one, so it gets its own date picker.
 function DriverAvailabilityPanel({ onToast }) {
   const [date, setDate] = useState(() => toISODate(new Date()));
   const [drivers, setDrivers] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [replacing, setReplacing] = useState(null); // driver needing coverage | null
-
-  const load = async () => {
-    setLoading(true);
-    try { setDrivers(await api.getFleetDrivers(date)); }
-    catch (e) { onToast(e.message, 'error'); }
-    finally { setLoading(false); }
-  };
-
+  const [replacing, setReplacing] = useState(null);
+  const load = async () => { setLoading(true); try { setDrivers(await api.getFleetDrivers(date)); } catch (e) { onToast(e.message, 'error'); } finally { setLoading(false); } };
   useEffect(() => { load(); }, [date]);
-
   const toggleAvailability = async (driver) => {
     const next = driver.driver_availability === 'available' ? 'unavailable' : 'available';
-    try {
-      await api.setDriverAvailability(driver.id, next);
-      onToast(`${driver.name} marked ${next}`, 'success');
-      load();
-    } catch (e) { onToast(e.message, 'error'); }
+    try { await api.setDriverAvailability(driver.id, next); onToast(`${driver.name} marked ${next}`, 'success'); load(); } catch (e) { onToast(e.message, 'error'); }
   };
-
-  if (!loading && drivers.length === 0) {
-    return (
-      <div className="card" style={{ marginBottom: 20 }}>
-        <div className="flex-between" style={{ marginBottom: 12 }}>
-          <div className="flex-center" style={{ gap: 8 }}>
-            <Truck size={16} />
-            <strong>Fleet Driver Availability</strong>
-          </div>
-          <input type="date" value={date} onChange={e => setDate(e.target.value)} style={{ width: 160 }} />
-        </div>
-        <div className="empty-state"><Truck size={28} /><p>No employees are flagged as fleet drivers</p></div>
-      </div>
-    );
-  }
-
   return (
     <div className="card" style={{ marginBottom: 20 }}>
       <div className="flex-between" style={{ marginBottom: 12 }}>
-        <div className="flex-center" style={{ gap: 8 }}>
-          <Truck size={16} />
-          <strong>Fleet Driver Availability</strong>
-          {drivers.some(d => d.needs_replacement) && (
-            <span className="flex-center" style={{ gap: 6, color: 'var(--danger, #ef4444)' }}>
-              <AlertTriangle size={14} />
-              {drivers.filter(d => d.needs_replacement).length} need coverage
-            </span>
-          )}
+        <div className="flex-center" style={{ gap: 8 }}><Truck size={16} /><strong>Fleet Driver Availability</strong>
+          {drivers.some(d => d.needs_replacement) && <span className="flex-center" style={{ gap: 6, color: 'var(--danger, #ef4444)' }}><AlertTriangle size={14} />{drivers.filter(d => d.needs_replacement).length} need coverage</span>}
         </div>
         <input type="date" value={date} onChange={e => setDate(e.target.value)} style={{ width: 160 }} />
       </div>
-      {loading ? (
-        <div className="loading"><div className="spinner" /> Loading driver roster…</div>
-      ) : (
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Employee ID</th>
-                <th>Attendance</th>
-                <th>Availability</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {drivers.map(d => (
-                <tr key={d.id}>
-                  <td>{d.name}</td>
-                  <td className="mono">{d.employee_id}</td>
-                  <td>
-                    <span className={`badge ${d.attendance_status === 'present' || d.attendance_status === 'late' ? 'active' : 'inactive'}`}>
-                      <span className="badge-dot" />{d.attendance_status.replace('_', ' ')}
-                    </span>
-                  </td>
-                  <td>
-                    <span className={`badge ${d.effective_availability === 'available' ? 'active' : 'inactive'}`}>
-                      <span className="badge-dot" />
-                      {{
-                        available: 'available',
-                        unavailable: 'unavailable',
-                        absent: 'absent',
-                        not_clocked_in: 'not clocked in',
-                      }[d.effective_availability]}
-                    </span>
-                  </td>
-                  <td>
-                    <div className="flex-center gap-2">
-                      <button className="btn btn-ghost btn-sm" onClick={() => toggleAvailability(d)}>
-                        Mark {d.driver_availability === 'available' ? 'Unavailable' : 'Available'}
-                      </button>
-                      {d.needs_replacement && (
-                        <button className="btn btn-primary btn-sm" onClick={() => setReplacing(d)}>
-                          <UserCheck size={13} /> Find Replacement
-                        </button>
-                      )}
-                    </div>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+      {loading ? <div className="loading"><div className="spinner" /> Loading...</div> : (
+        <div className="table-wrap"><table><thead><tr><th>Name</th><th>Status</th><th></th></tr></thead><tbody>{drivers.map(d => <tr key={d.id}><td>{d.name}</td><td><span className={`badge ${d.effective_availability === 'available' ? 'active' : 'inactive'}`}>{d.effective_availability}</span></td><td><div className="flex-center gap-2"><button className="btn btn-ghost btn-sm" onClick={() => toggleAvailability(d)}>Toggle</button>{d.needs_replacement && <button className="btn btn-primary btn-sm" onClick={() => setReplacing(d)}><UserCheck size={13} /> Replace</button>}</div></td></tr>)}</tbody></table></div>
       )}
-
-      {replacing && (
-        <ReplacementModal
-          absentDriver={replacing}
-          date={date}
-          onClose={() => setReplacing(null)}
-          onAssigned={load}
-          onToast={onToast}
-        />
-      )}
+      {replacing && <ReplacementModal absentDriver={replacing} date={date} onClose={() => setReplacing(null)} onAssigned={load} onToast={onToast} />}
     </div>
   );
 }
 
+// ─── MAIN SCHEDULE PAGE (MERGED VIEW - LIST + GRID) ──────────────────────────
 export default function SchedulePage({ onToast }) {
   const [employees, setEmployees] = useState([]);
   const [templates, setTemplates] = useState([]);
+  const [positions, setPositions] = useState([]);
   const [assignments, setAssignments] = useState([]);
+  const [coverage, setCoverage] = useState([]);
+  const [totals, setTotals] = useState({ total_required: 0, total_assigned: 0, understaffed_slots: 0 });
   const [loading, setLoading] = useState(true);
-  const [employeeFilter, setEmployeeFilter] = useState('');
   const [showTemplates, setShowTemplates] = useState(false);
   const [showAssign, setShowAssign] = useState(false);
+  
+  // Requirement Modal State
+  const [showReqModal, setShowReqModal] = useState(false);
+  const [editingReq, setEditingReq] = useState(null);
+
+  // 🟢 NEW: Position Filter State
+  const [positionFilter, setPositionFilter] = useState('all');
 
   const [range, setRange] = useState(() => {
     const start = startOfWeek(new Date());
@@ -553,184 +218,330 @@ export default function SchedulePage({ onToast }) {
   const load = async () => {
     setLoading(true);
     try {
-      const [emps, tmpls, sched] = await Promise.all([
+      const [emps, tmpls, positionsList, sched, cov] = await Promise.all([
         api.getEmployees(),
         api.getShiftTemplates(),
-        api.getSchedule({ start_date: range.start, end_date: range.end, ...(employeeFilter && { employee_id: employeeFilter }) }),
+        api.getPositions(),
+        api.getSchedule({ start_date: range.start, end_date: range.end }),
+        api.getCoverage({ start_date: range.start, end_date: range.end }),
       ]);
       setEmployees(emps);
       setTemplates(tmpls);
+      setPositions(positionsList);
       setAssignments(sched);
-    } catch (e) { onToast(e.message, 'error'); }
+      setCoverage(cov.coverage);
+      setTotals(cov.totals);
+    } catch (e) { onToast(e.message, 'error'); } 
     finally { setLoading(false); }
   };
 
-  useEffect(() => { load(); }, [range.start, range.end, employeeFilter]);
+  useEffect(() => { load(); }, [range.start, range.end]);
 
   const saveTemplate = async (id, form) => {
-    if (id) {
-      const updated = await api.updateShiftTemplate(id, form);
-      setTemplates(ts => ts.map(t => t.id === id ? updated : t));
-      onToast('Shift template updated', 'success');
-    } else {
-      const created = await api.createShiftTemplate(form);
-      setTemplates(ts => [...ts, created]);
-      onToast('Shift template added', 'success');
-    }
+    if (id) { const updated = await api.updateShiftTemplate(id, form); setTemplates(ts => ts.map(t => t.id === id ? updated : t)); } 
+    else { const created = await api.createShiftTemplate(form); setTemplates(ts => [...ts, created]); }
+    onToast('Template saved', 'success');
   };
-
-  const deleteTemplate = async (id) => {
-    await api.deleteShiftTemplate(id);
-    setTemplates(ts => ts.filter(t => t.id !== id));
-    onToast('Shift template deleted', 'success');
-  };
+  const deleteTemplate = async (id) => { await api.deleteShiftTemplate(id); setTemplates(ts => ts.filter(t => t.id !== id)); onToast('Template deleted', 'success'); };
 
   const removeAssignment = async (id) => {
-    if (!confirm('Remove this shift assignment?')) return;
+    if (!confirm('Remove this assignment?')) return;
+    try { await api.deleteShiftAssignment(id); setAssignments(a => a.filter(x => x.id !== id)); onToast('Assignment removed', 'success'); } 
+    catch (e) { onToast(e.message, 'error'); }
+  };
+
+  const removeRequirement = async (row) => {
+    if (!confirm(`Remove requirement for ${row.positions?.name || 'position'}?`)) return;
+    try { await api.deleteStaffingRequirement(row.id); onToast('Requirement removed', 'success'); load(); } 
+    catch (e) { onToast(e.message, 'error'); }
+  };
+
+  // ─── CALENDAR GRID LOGIC ──────────────────────────────────────────────────────
+  const datesInRange = useMemo(() => {
+    const dates = [];
+    let current = new Date(range.start);
+    const end = new Date(range.end);
+    while (current <= end) { dates.push(toISODate(current)); current.setDate(current.getDate() + 1); }
+    return dates;
+  }, [range]);
+
+  const assignmentMap = useMemo(() => {
+    const map = {};
+    assignments.forEach(a => { if (!map[a.date]) map[a.date] = {}; map[a.date][a.employee_id] = a; });
+    return map;
+  }, [assignments]);
+
+  const activeEmployees = useMemo(() => employees.filter(e => e.status === 'active'), [employees]);
+  const totalShifts = assignments.filter(a => !a.is_day_off).length;
+  const totalRestDays = assignments.filter(a => a.is_day_off).length;
+
+  // ─── REQUIREMENT MODAL LOGIC ──────────────────────────────────────────────────
+  const saveRequirement = async () => {
     try {
-      await api.deleteShiftAssignment(id);
-      setAssignments(a => a.filter(x => x.id !== id));
-      onToast('Assignment removed', 'success');
+      if (editingReq?.id) {
+        await api.updateStaffingRequirement(editingReq.id, { required_count: editingReq.required_count, notes: editingReq.notes });
+      } else {
+        await api.createStaffingRequirement({
+          position_id: editingReq.position_id,
+          shift_template_id: editingReq.shift_template_id,
+          date: editingReq.date,
+          required_count: editingReq.required_count,
+          notes: editingReq.notes
+        });
+      }
+      onToast('Requirement saved', 'success');
+      setShowReqModal(false);
+      load();
     } catch (e) { onToast(e.message, 'error'); }
   };
 
   const shiftWeek = (dir) => {
-    const start = new Date(range.start);
-    start.setDate(start.getDate() + dir * 7);
-    const end = new Date(start);
-    end.setDate(end.getDate() + 6);
-    setRange({ start: toISODate(start), end: toISODate(end) });
+    const s = new Date(range.start); s.setDate(s.getDate() + dir * 7);
+    const e = new Date(s); e.setDate(e.getDate() + 6);
+    setRange({ start: toISODate(s), end: toISODate(e) });
   };
 
-  const grouped = useMemo(() => {
+  // 🟢 FILTERED DATA for Requirements
+  const filteredCoverage = useMemo(() => {
+    if (positionFilter === 'all') return coverage;
+    return coverage.filter(c => c.positions?.name === positionFilter);
+  }, [coverage, positionFilter]);
+
+  // 🟢 FILTERED DATA for Employees Grid
+  const filteredEmployees = useMemo(() => {
+    if (positionFilter === 'all') return activeEmployees;
+    return activeEmployees.filter(e => e.position === positionFilter);
+  }, [activeEmployees, positionFilter]);
+
+  // Group coverage by date for the list view
+  const groupedCoverage = useMemo(() => {
     const map = {};
-    assignments.forEach(a => {
-      if (!map[a.date]) map[a.date] = [];
-      map[a.date].push(a);
-    });
+    filteredCoverage.forEach(c => { (map[c.date] ||= []).push(c); });
     return Object.entries(map).sort(([a], [b]) => a.localeCompare(b));
-  }, [assignments]);
+  }, [filteredCoverage]);
 
   return (
     <div className="page">
+      {/* Header */}
       <div className="flex-between" style={{ marginBottom: 24 }}>
         <div>
           <h2 style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.5px' }}>Shift &amp; Schedule Management</h2>
-          <p className="text-dim text-sm" style={{ marginTop: 4 }}>
-            {assignments.filter(a => !a.is_day_off).length} shift(s) · {assignments.filter(a => a.is_day_off).length} rest day(s) scheduled this range
-          </p>
+          <p className="text-dim text-sm" style={{ marginTop: 4 }}>{totalShifts} shift(s) · {totalRestDays} rest day(s) scheduled</p>
         </div>
         <div className="flex-center gap-2">
-          <button className="btn btn-ghost" onClick={() => setShowTemplates(true)}>
-            <Clock size={14} /> Manage Shift Templates
-          </button>
-          <button className="btn btn-primary" onClick={() => setShowAssign(true)} disabled={employees.length === 0}>
-            <Plus size={14} /> Assign Shift
-          </button>
+          <button className="btn btn-ghost" onClick={() => setShowTemplates(true)}><Clock size={14} /> Manage Templates</button>
+          <button className="btn btn-primary" onClick={() => setShowAssign(true)} disabled={employees.length === 0}><Plus size={14} /> Assign Shift</button>
         </div>
       </div>
 
+      {/* Driver Availability (Separate Card) */}
       <DriverAvailabilityPanel onToast={onToast} />
 
-      <div className="card" style={{ marginBottom: 20 }}>
-        <div className="flex-between" style={{ gap: 12, flexWrap: 'wrap' }}>
+      {/* 🌟 MERGED PANEL (Requirements LIST + Schedule GRID) */}
+      <div className="card">
+        {/* Panel Controls (Date range + Actions + Filter) */}
+        <div className="flex-between" style={{ padding: '16px 20px', borderBottom: '1px solid var(--border)', marginBottom: 0, flexWrap: 'wrap', gap: '12px' }}>
           <div className="flex-center gap-2">
             <button className="btn btn-ghost btn-sm" onClick={() => shiftWeek(-1)}>← Prev week</button>
             <span className="mono text-sm">{range.start} → {range.end}</span>
             <button className="btn btn-ghost btn-sm" onClick={() => shiftWeek(1)}>Next week →</button>
           </div>
-          <select value={employeeFilter} onChange={e => setEmployeeFilter(e.target.value)} style={{ width: 200 }}>
-            <option value="">All employees</option>
-            {employees.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
-          </select>
-        </div>
-      </div>
-
-      <div className="card">
-        {loading ? (
-          <div className="loading"><div className="spinner" /> Loading schedule…</div>
-        ) : assignments.length === 0 ? (
-          <div className="empty-state">
-            <Calendar size={36} />
-            <p>No shifts or rest days scheduled in this range</p>
-            {templates.length === 0 && (
-              <p className="text-dim text-sm" style={{ marginTop: 4 }}>
-                Add a shift template first if you want to schedule working shifts — rest days can be set without one.
-              </p>
+          <div className="flex-center gap-2" style={{ flexWrap: 'wrap' }}>
+            <span className="text-dim text-sm">{totals.total_assigned}/{totals.total_required} filled</span>
+            {totals.understaffed_slots > 0 && (
+              <span className="flex-center" style={{ gap: 6, color: 'var(--danger, #ef4444)' }}><AlertTriangle size={14} /> {totals.understaffed_slots} short-staffed</span>
             )}
-          </div>
-        ) : (
-          grouped.map(([date, items]) => (
-            <div key={date} style={{ marginBottom: 20 }}>
-              <div className="flex-center" style={{ gap: 8, marginBottom: 8 }}>
-                <strong>{new Date(date + 'T00:00:00').toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' })}</strong>
-                <span className="text-dim text-sm">{date}</span>
-              </div>
-              <div className="table-wrap">
-                <table>
-                  <thead>
-                    <tr><th>Employee</th><th>Shift</th><th>Time</th><th>Notes</th><th></th></tr>
-                  </thead>
-                  <tbody>
-                    {items.map(a => (
-                      <tr key={a.id}>
-                        <td>{a.employees?.name || '—'}</td>
-                        {a.is_day_off ? (
-                          <>
-                            <td colSpan={2}>
-                              <span className="badge inactive" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                                <span className="badge-dot" /> Rest day
-                              </span>
-                            </td>
-                          </>
-                        ) : (
-                          <>
-                            <td>
-                              <span className="flex-center" style={{ gap: 8 }}>
-                                <span style={{ width: 10, height: 10, borderRadius: '50%', background: a.shift_templates?.color || '#3b82f6', display: 'inline-block' }} />
-                                {a.shift_templates?.name || '—'}
-                              </span>
-                            </td>
-                            <td className="mono text-sm">
-                              {formatTime(a.shift_templates?.start_time)} – {formatTime(a.shift_templates?.end_time)}
-                            </td>
-                          </>
-                        )}
-                        <td className="text-muted">{a.notes || '—'}</td>
-                        <td>
-                          <button className="btn btn-icon btn-danger btn-sm" onClick={() => removeAssignment(a.id)} title="Remove">
-                            <Trash2 size={13} />
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+            
+            {/* 🟢 NEW DROPDOWN FILTER */}
+            <div className="flex-center" style={{ gap: 6 }}>
+              <Filter size={14} className="text-dim" />
+              <select 
+                value={positionFilter} 
+                onChange={e => setPositionFilter(e.target.value)}
+                style={{ padding: '4px 8px', fontSize: '0.85rem', borderRadius: '4px', border: '1px solid var(--border)' }}
+              >
+                <option value="all">All Positions</option>
+                {positions.map(p => (
+                  <option key={p.id} value={p.name}>{p.name}</option>
+                ))}
+              </select>
             </div>
-          ))
+
+            <button 
+              className="btn btn-primary btn-sm" 
+              onClick={() => { 
+                setEditingReq({ 
+                  position_id: positions[0]?.id || '', 
+                  shift_template_id: templates[0]?.id || '', 
+                  date: toISODate(new Date()), 
+                  required_count: 1, 
+                  notes: '' 
+                }); 
+                setShowReqModal(true); 
+              }} 
+              disabled={positions.length === 0 || templates.length === 0}
+            >
+              <Plus size={13} /> Set Requirement
+            </button>
+          </div>
+        </div>
+
+        {loading ? (
+          <div className="loading" style={{ padding: 40 }}><div className="spinner" /> Loading…</div>
+        ) : (
+          <>
+            {/* 1. STAFFING REQUIREMENTS LIST */}
+            <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border-light)' }}>
+              <div className="flex-center" style={{ gap: 8, marginBottom: 12 }}>
+                <ClipboardList size={16} />
+                <strong>Staffing Requirements</strong>
+                {positionFilter !== 'all' && <span className="badge active" style={{ fontSize: '0.7rem' }}>Filtered: {positionFilter}</span>}
+              </div>
+              
+              {filteredCoverage.length === 0 ? (
+                <div className="empty-state" style={{ padding: '20px 0' }}>
+                  <ClipboardList size={28} />
+                  <p>{positionFilter === 'all' ? 'No staffing requirements set for this range' : `No staffing requirements found for "${positionFilter}"`}</p>
+                </div>
+              ) : (
+                groupedCoverage.map(([date, rows]) => (
+                  <div key={date} style={{ marginBottom: 16 }}>
+                    <div className="flex-center" style={{ gap: 8, marginBottom: 6 }}>
+                      <strong style={{ fontSize: '0.9rem' }}>{new Date(date + 'T00:00:00').toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' })}</strong>
+                      <span className="text-dim text-sm">{date}</span>
+                    </div>
+                    <div className="table-wrap">
+                      <table>
+                        <thead><tr><th>Position</th><th>Shift</th><th>Required</th><th>Assigned</th><th>Status</th><th></th></tr></thead>
+                        <tbody>
+                          {rows.map(r => (
+                            <tr key={r.id}>
+                              <td><strong>{r.positions?.name || '—'}</strong></td>
+                              <td><span className="flex-center" style={{ gap: 8 }}><span style={{ width: 10, height: 10, borderRadius: '50%', background: r.roles?.color || '#3b82f6', display: 'inline-block' }} /> {r.roles?.name || '—'}</span></td>
+                              <td className="mono text-sm">{r.required_count}</td>
+                              <td className="mono text-sm" title={r.assigned_employees.map(e => e.name).join(', ') || undefined}>{r.assigned_count}</td>
+                              <td><StatusBadge status={r.status} gap={r.gap} /></td>
+                              <td>
+                                <div className="flex-center gap-2">
+                                  <button className="btn btn-icon btn-ghost btn-sm" onClick={() => { setEditingReq(r); setShowReqModal(true); }} title="Edit"><Edit2 size={13} /></button>
+                                  <button className="btn btn-icon btn-danger btn-sm" onClick={() => removeRequirement(r)} title="Remove"><Trash2 size={13} /></button>
+                                </div>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            {/* 2. EMPLOYEE SCHEDULE GRID */}
+            <div style={{ padding: '16px 20px' }}>
+              {filteredEmployees.length === 0 ? (
+                <div className="empty-state"><Calendar size={36} /><p>{positionFilter === 'all' ? 'No active employees found.' : `No active employees with position "${positionFilter}" found.`}</p></div>
+              ) : assignments.length === 0 ? (
+                <div className="empty-state"><Calendar size={36} /><p>No shifts or rest days scheduled in this range.</p></div>
+              ) : (
+                <div className="table-wrap">
+                  <table className="schedule-grid" style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.9rem' }}>
+                    <thead>
+                      <tr>
+                        <th style={{ textAlign: 'left', padding: '12px 16px', borderBottom: '2px solid var(--border)', minWidth: '160px' }}>Employee</th>
+                        {datesInRange.map(date => (
+                          <th key={date} style={{ textAlign: 'center', padding: '8px', borderBottom: '2px solid var(--border)', minWidth: '80px' }}>
+                            <div style={{ fontWeight: 600, fontSize: '0.75rem' }}>{new Date(date + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'short' })}</div>
+                            <div style={{ fontSize: '0.65rem', color: 'var(--text-muted)' }}>{new Date(date + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</div>
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredEmployees.map(emp => (
+                        <tr key={emp.id} style={{ borderBottom: '1px solid var(--border-light)' }}>
+                          <td style={{ padding: '8px 16px', fontWeight: 500 }}>
+                            {emp.name}
+                            <div style={{ fontSize: '0.7rem', fontWeight: 400, color: 'var(--text-muted)' }}>{emp.employee_id} · {emp.position || '—'}</div>
+                          </td>
+                          {datesInRange.map(date => {
+                            const assignment = assignmentMap[date]?.[emp.id];
+                            const isDayOff = assignment?.is_day_off;
+                            const shiftData = assignment?.shift_templates;
+
+                            let cellContent;
+                            let cellStyle = { padding: '8px', textAlign: 'center', verticalAlign: 'middle' };
+
+                            if (!assignment) cellContent = <span style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>—</span>;
+                            else if (isDayOff) cellContent = <span className="badge inactive" style={{ display: 'inline-block', padding: '4px 10px', borderRadius: '4px', fontSize: '0.75rem' }}>Rest day</span>;
+                            else cellContent = (
+                              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', backgroundColor: shiftData?.color || '#3b82f6', color: '#fff', borderRadius: '6px', padding: '6px 4px', position: 'relative' }}>
+                                <strong style={{ fontSize: '0.75rem', marginBottom: '2px' }}>{shiftData?.name || 'Shift'}</strong>
+                                <span style={{ fontSize: '0.65rem', opacity: 0.9 }}>{formatTime(shiftData?.start_time)} - {formatTime(shiftData?.end_time)}</span>
+                                <button className="btn btn-icon btn-danger" style={{ position: 'absolute', top: '-6px', right: '-6px', width: '18px', height: '18px', padding: 0, fontSize: '10px', borderRadius: '50%' }} onClick={() => removeAssignment(assignment.id)}><Trash2 size={10} /></button>
+                              </div>
+                            );
+                            return <td key={date} style={cellStyle}>{cellContent}</td>;
+                          })}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </>
         )}
       </div>
 
-      {showTemplates && (
-        <ShiftTemplateModal
-          templates={templates}
-          onClose={() => setShowTemplates(false)}
-          onSave={saveTemplate}
-          onDelete={deleteTemplate}
-          onToast={onToast}
-        />
-      )}
-
-      {showAssign && (
-        <AssignShiftModal
-          employees={employees}
-          templates={templates}
-          onClose={() => setShowAssign(false)}
-          onAssign={async (body) => { const r = await api.assignShift(body); load(); return r; }}
-          onAssignRecurring={async (body) => { const r = await api.assignRecurringShift(body); load(); return r; }}
-          onToast={onToast}
-        />
+      {/* Modals */}
+      {showTemplates && <ShiftTemplateModal templates={templates} onClose={() => setShowTemplates(false)} onSave={saveTemplate} onDelete={deleteTemplate} onToast={onToast} />}
+      {showAssign && <AssignShiftModal employees={employees} templates={templates} onClose={() => setShowAssign(false)} onAssign={async (b) => { await api.assignShift(b); load(); }} onAssignRecurring={async (b) => { await api.assignRecurringShift(b); load(); }} onToast={onToast} />}
+      
+      {showReqModal && (
+        <div className="modal-overlay">
+          <div className="modal">
+            <div className="modal-header">
+              <span className="modal-title">{editingReq?.id ? 'Edit Requirement' : 'Set Requirement'}</span>
+              <button className="btn btn-icon btn-ghost" onClick={() => setShowReqModal(false)}>✕</button>
+            </div>
+            <div className="form-grid">
+              <div className="form-group full">
+                <label>Position</label>
+                <select value={editingReq?.position_id || ''} onChange={e => setEditingReq(r => ({ ...r, position_id: e.target.value }))} disabled={!!editingReq?.id}>
+                  {positions.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                </select>
+              </div>
+              <div className="form-group full">
+                <label>Shift / Role</label>
+                <select value={editingReq?.shift_template_id || ''} onChange={e => setEditingReq(r => ({ ...r, shift_template_id: e.target.value }))} disabled={!!editingReq?.id}>
+                  {templates.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+                </select>
+              </div>
+              <div className="form-group">
+                <label>Date</label>
+                <input 
+                  type="date" 
+                  value={editingReq?.date || toISODate(new Date())} 
+                  onChange={e => setEditingReq(r => ({ ...r, date: e.target.value }))} 
+                  disabled={!!editingReq?.id} 
+                />
+              </div>
+              <div className="form-group">
+                <label>Required</label>
+                <input type="number" min="1" value={editingReq?.required_count || 1} onChange={e => setEditingReq(r => ({ ...r, required_count: parseInt(e.target.value) }))} />
+              </div>
+              <div className="form-group full">
+                <label>Notes</label>
+                <input value={editingReq?.notes || ''} onChange={e => setEditingReq(r => ({ ...r, notes: e.target.value }))} placeholder="Optional" />
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button className="btn btn-ghost" onClick={() => setShowReqModal(false)}>Cancel</button>
+              <button className="btn btn-primary" onClick={saveRequirement}>Save</button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

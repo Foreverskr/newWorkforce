@@ -34,7 +34,10 @@ export default function ClockPage({ onToast }) {
   // Only an admin-assigned working shift permits a clock-in — no row at all
   // (never scheduled) and an explicit day-off row are both treated as "not
   // scheduled to work today". Mirrors the check enforced server-side.
-  const hasShiftToday = !!(todaySchedule && !todaySchedule.is_day_off && todaySchedule.shift_template_id);
+  // NOTE: getSchedule returns the raw shift_assignments row, whose FK column
+  // is `role_id` (aliased separately as `shift_templates` for the joined
+  // template details) — there is no `shift_template_id` field in the response.
+  const hasShiftToday = !!(todaySchedule && !todaySchedule.is_day_off && todaySchedule.role_id);
 
   const handleClock = async (action) => {
     if (!selected) return;
