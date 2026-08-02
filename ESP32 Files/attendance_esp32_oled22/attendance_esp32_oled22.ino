@@ -1,5 +1,5 @@
 // ESP32 + AS608/R307 attendance kiosk — WITH 2.8" ILI9341 TFT STATUS DISPLAY
-// Adapted for Adafruit_ILI9341 (tested & working display)
+// + MICRO SD CARD OFFLINE BACKUP (identify + punch even if server is down)
 // -----------------------------------------------------------------------
 
 #include <WiFi.h>
@@ -9,6 +9,7 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
+#include <SD.h>
 #include "time.h"
 #include "base64.h"
 
@@ -31,6 +32,15 @@ const unsigned long SYNC_INTERVAL_MS   = 60000;
 #define TFT_DC   2
 #define TFT_RST  4
 // SCK/MOSI/MISO use ESP32's default VSPI pins (18 / 23 / 19)
+
+// ─── SD CARD CONFIG ────────────────────────────────────────────────────────
+// SD module shares the same VSPI bus as the TFT (MOSI 23 / MISO 19 / SCK 18),
+// it just needs its own CS line. Wire the SD module's CS pin to GPIO 33
+// (change here if you wired it elsewhere).
+#define SD_CS 33
+const char* LOCAL_CACHE_FILE     = "/employees.csv";       // sensor_slot_id,employee_id,name
+const char* PENDING_PUNCHES_FILE = "/pending_punches.csv"; // employee_id,name,local_timestamp
+bool sdReady = false;
 
 // ─── NTP / CLOCK CONFIG ───────────────────────────────────────────────────
 const char* NTP_SERVER   = "pool.ntp.org";
@@ -113,7 +123,7 @@ String currentDateString() {
   return String(buf);
 }
 
-// Top bar: WiFi status dot + live clock. Cheap to redraw, called often.
+// Top bar: WiFi status dot + SD status dot + live clock. Cheap to redraw.
 void drawHeader() {
   tft.fillRect(0, 0, 320, 22, COL_BG);
   tft.drawFastHLine(0, 22, 320, COL_DIM);
@@ -122,6 +132,10 @@ void drawHeader() {
   tft.setTextColor(WiFi.status() == WL_CONNECTED ? COL_OK : COL_ERR);
   tft.setCursor(6, 7);
   tft.print(WiFi.status() == WL_CONNECTED ? "WiFi OK" : "WiFi --");
+
+  tft.setTextColor(sdReady ? COL_OK : COL_DIM);
+  tft.setCursor(70, 7);
+  tft.print(sdReady ? "SD OK" : "SD --");
 
   tft.setTextColor(COL_TEXT);
   String t = currentTimeString();
@@ -199,8 +213,62 @@ void setup() {
   Serial.begin(115200);
   delay(300);
 
-  // Initialize SPI and TFT display
+  // Deselect the TFT's CS line before any SPI traffic starts. tft.begin()
+  // hasn't run yet, so nothing has configured this pin - leaving it
+  // floating while the SD card initializes could make the TFT (once it
+  // does start up) see stray bus noise as commands.
+  pinMode(TFT_CS, OUTPUT);
+  digitalWrite(TFT_CS, HIGH);
+
+  // Initialize the shared SPI bus (used by both TFT and SD card)
   SPI.begin(18, 19, 23, TFT_CS);
+
+  // Initialize the SD card FIRST, before the TFT drives the bus.
+  // On some ESP32 core versions, SD.begin() (esp_vfs_fat_sdspi_mount)
+  // can fail to mount if another SPI device has already been actively
+  // driven on the same bus - doing this before tft.begin() avoids that
+  // class of failure. Wiring can be 100% correct and SD.begin() will
+  // still fail if this ordering isn't respected.
+  // Try default speed first, then fall back to a slower, more forgiving
+  // speed - cheap modules / long jumper wires often can't handle 4MHz.
+  bool sdOk = SD.begin(SD_CS);
+  if (!sdOk) {
+    Serial.println("SD.begin() at default speed failed, retrying at 1MHz...");
+    SD.end();
+    sdOk = SD.begin(SD_CS, SPI, 1000000);
+  }
+
+  if (!sdOk) {
+    Serial.println("SD card init FAILED - offline backup disabled. Check wiring/card/format.");
+    sdReady = false;
+  } else {
+    uint8_t cardType = SD.cardType();
+    if (cardType == CARD_NONE) {
+      Serial.println("SD.begin() succeeded but no card detected - check the card is seated.");
+      sdReady = false;
+    } else {
+      const char* typeStr = (cardType == CARD_MMC) ? "MMC" :
+                             (cardType == CARD_SD)  ? "SDSC" :
+                             (cardType == CARD_SDHC) ? "SDHC" : "UNKNOWN";
+      uint64_t cardSizeMB = SD.cardSize() / (1024 * 1024);
+      Serial.printf("SD card type: %s, size: %llu MB\n", typeStr, cardSizeMB);
+    }
+  }
+
+  if (sdOk && SD.cardType() != CARD_NONE) {
+    Serial.println("SD card ready - offline backup enabled.");
+    sdReady = true;
+    if (!SD.exists(PENDING_PUNCHES_FILE)) {
+      File f = SD.open(PENDING_PUNCHES_FILE, FILE_WRITE);
+      if (f) f.close();
+    }
+    if (!SD.exists(LOCAL_CACHE_FILE)) {
+      File f = SD.open(LOCAL_CACHE_FILE, FILE_WRITE);
+      if (f) f.close();
+    }
+  }
+
+  // Now bring up the TFT display
   tft.begin();
   tft.setRotation(1);          // landscape
   tft.fillScreen(ILI9341_BLACK);
@@ -237,6 +305,7 @@ void setup() {
   }
 
   syncPendingTemplates();
+  syncPendingPunches();
   showIdleScreen();
 }
 
@@ -248,6 +317,7 @@ void loop() {
   if (millis() - lastSync >= SYNC_INTERVAL_MS) {
     lastSync = millis();
     syncPendingTemplates();
+    syncPendingPunches();
     showIdleScreen();
   }
 
@@ -313,10 +383,34 @@ void handleSerialCommands() {
       return;
     }
 
+    // Wipe the local offline cache too, so we don't hand out stale
+    // employee identities for sensor slots that no longer exist.
+    if (sdReady) {
+      SD.remove(LOCAL_CACHE_FILE);
+      File f = SD.open(LOCAL_CACHE_FILE, FILE_WRITE);
+      if (f) f.close();
+    }
+
     showStatus("Wipe OK", "Resyncing...", COL_OK);
     syncPendingTemplates();
     showIdleScreen();
+  } else if (cmd.equalsIgnoreCase("sdstatus")) {
+    if (!sdReady) {
+      Serial.println("SD card not ready.");
+    } else {
+      Serial.println("--- employees.csv ---");
+      printFile(LOCAL_CACHE_FILE);
+      Serial.println("--- pending_punches.csv ---");
+      printFile(PENDING_PUNCHES_FILE);
+    }
   }
+}
+
+void printFile(const char* path) {
+  File f = SD.open(path, FILE_READ);
+  if (!f) { Serial.println("(missing)"); return; }
+  while (f.available()) Serial.write(f.read());
+  f.close();
 }
 
 bool resetBackendSyncState() {
@@ -475,6 +569,10 @@ void syncPendingTemplates() {
       Serial.printf("register-synced did not confirm for %s - will retry next cycle\n", name.c_str());
     }
 
+    // Also refresh the offline lookup cache so this employee can be
+    // identified locally the moment the server is unreachable.
+    cacheEmployeeLocally(localSlot, employeeId, name);
+
     flushAndSettleSensor(300);
   }
 
@@ -506,82 +604,295 @@ bool registerSynced(const String& employeeId, const String& slotLabel, uint16_t 
   return (code == 200 || code == 201);
 }
 
+// ─── OFFLINE CACHE / QUEUE HELPERS ─────────────────────────────────────────
+
+// Rewrites employees.csv, replacing any existing row for this sensor slot
+// (or appending a new one). Small file, so a full rewrite per update is
+// fine for typical roster sizes (tens to a few hundred employees).
+void cacheEmployeeLocally(uint16_t sensorSlotId, const String& employeeId, const String& name) {
+  if (!sdReady) return;
+
+  String rewritten = "";
+  bool found = false;
+
+  File src = SD.open(LOCAL_CACHE_FILE, FILE_READ);
+  if (src) {
+    while (src.available()) {
+      String line = src.readStringUntil('\n');
+      line.trim();
+      if (line.length() == 0) continue;
+      int firstComma = line.indexOf(',');
+      if (firstComma > 0 && (uint16_t)line.substring(0, firstComma).toInt() == sensorSlotId) {
+        rewritten += String(sensorSlotId) + "," + employeeId + "," + name + "\n";
+        found = true;
+      } else {
+        rewritten += line + "\n";
+      }
+    }
+    src.close();
+  }
+  if (!found) {
+    rewritten += String(sensorSlotId) + "," + employeeId + "," + name + "\n";
+  }
+
+  SD.remove(LOCAL_CACHE_FILE);
+  File dst = SD.open(LOCAL_CACHE_FILE, FILE_WRITE);
+  if (dst) {
+    dst.print(rewritten);
+    dst.close();
+  } else {
+    Serial.println("WARNING: could not write employees.csv cache");
+  }
+}
+
+// Looks up a sensor slot in the local cache. Returns true and fills
+// employeeId/name if found.
+bool localIdentify(uint16_t sensorSlotId, String &employeeId, String &name) {
+  if (!sdReady) return false;
+  File f = SD.open(LOCAL_CACHE_FILE, FILE_READ);
+  if (!f) return false;
+
+  bool found = false;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    int c1 = line.indexOf(',');
+    int c2 = line.indexOf(',', c1 + 1);
+    if (c1 < 0 || c2 < 0) continue;
+    uint16_t slot = (uint16_t)line.substring(0, c1).toInt();
+    if (slot == sensorSlotId) {
+      employeeId = line.substring(c1 + 1, c2);
+      name = line.substring(c2 + 1);
+      found = true;
+      break;
+    }
+  }
+  f.close();
+  return found;
+}
+
+// Appends a punch to pending_punches.csv so it isn't lost while the
+// server/WiFi is down. Uses the device's local clock (from the last NTP
+// sync) if available; otherwise falls back to an uptime marker so the
+// event still isn't discarded, but flag it for manual review since we
+// can't attach a real wall-clock time without NTP.
+bool savePendingPunch(const String& employeeId, const String& name) {
+  if (!sdReady) return false;
+
+  struct tm timeinfo;
+  String ts;
+  if (getLocalTime(&timeinfo, 0)) {
+    char buf[24];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    ts = String(buf);
+  } else {
+    ts = "UNSYNCED-uptime-" + String(millis() / 1000) + "s";
+  }
+
+  File f = SD.open(PENDING_PUNCHES_FILE, FILE_WRITE); // appends on ESP32 SD lib
+  if (!f) return false;
+  f.println(employeeId + "," + name + "," + ts);
+  f.close();
+  Serial.printf("Saved offline punch: %s @ %s\n", name.c_str(), ts.c_str());
+  return true;
+}
+
+// Replays queued offline punches to the server. Lines that fail to sync
+// are kept in the file for the next retry; synced lines are dropped.
+//
+// IMPORTANT: this sends the actual scan time as "client_timestamp" in the
+// payload. Your backend's /api/device/attendance/punch handler needs to
+// read that field and use it as the punch time when present - otherwise
+// offline punches will be recorded with whatever time the sync happened,
+// not when the person actually scanned.
+void syncPendingPunches() {
+  if (!sdReady || WiFi.status() != WL_CONNECTED) return;
+  if (!SD.exists(PENDING_PUNCHES_FILE)) return;
+
+  File f = SD.open(PENDING_PUNCHES_FILE, FILE_READ);
+  if (!f) return;
+
+  String remaining = "";
+  int totalLines = 0;
+  int syncedCount = 0;
+
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    totalLines++;
+
+    int c1 = line.indexOf(',');
+    int c2 = line.indexOf(',', c1 + 1);
+    if (c1 < 0 || c2 < 0) {
+      remaining += line + "\n"; // malformed, keep so nothing silently vanishes
+      continue;
+    }
+
+    String employeeId = line.substring(0, c1);
+    String name = line.substring(c1 + 1, c2);
+    String ts = line.substring(c2 + 1);
+
+    StaticJsonDocument<192> doc;
+    doc["employee_id"] = employeeId;
+    doc["device_id"] = DEVICE_ID;
+    doc["client_timestamp"] = ts;
+    String payload;
+    serializeJson(doc, payload);
+
+    HTTPClient http;
+    http.begin(String(SERVER_URL) + "/api/device/attendance/punch");
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("x-device-key", DEVICE_API_KEY);
+    http.setTimeout(4000);
+    int code = http.POST(payload);
+    http.end();
+
+    if (code == 200 || code == 201) {
+      syncedCount++;
+      Serial.printf("Synced offline punch: %s @ %s\n", name.c_str(), ts.c_str());
+    } else if (code == 409) {
+      // Conflict = the server already has a punch recorded for this
+      // employee/time (e.g. they were manually clocked in while offline,
+      // or a previous sync attempt actually succeeded before the ESP32
+      // got the response). This is a resolved state, not a failure -
+      // clear it from the queue instead of retrying forever.
+      syncedCount++;
+      Serial.printf("Already recorded on server (HTTP 409) - clearing from queue: %s @ %s\n", name.c_str(), ts.c_str());
+    } else {
+      remaining += line + "\n"; // keep for retry next cycle
+      Serial.printf("Retry later - sync failed for %s, HTTP %d\n", name.c_str(), code);
+    }
+  }
+  f.close();
+
+  SD.remove(PENDING_PUNCHES_FILE);
+  File out = SD.open(PENDING_PUNCHES_FILE, FILE_WRITE);
+  if (out) {
+    out.print(remaining);
+    out.close();
+  }
+
+  if (syncedCount > 0) {
+    Serial.printf("Offline punch sync: %d/%d synced\n", syncedCount, totalLines);
+    showStatus("Synced", String(syncedCount) + " offline punch(es)", COL_OK, STEP_SYNC);
+    delay(1000);
+  }
+}
+
+// ─── IDENTIFY + PUNCH (online with automatic offline fallback) ────────────
+
 void identifyAndPunch(uint16_t sensorSlotId) {
-  HTTPClient http;
-  http.begin(String(SERVER_URL) + "/api/device/fingerprints/identify");
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("x-device-key", DEVICE_API_KEY);
+  String employeeId, name;
+  bool gotOnline = false;
 
-  StaticJsonDocument<128> reqDoc;
-  reqDoc["device_id"] = DEVICE_ID;
-  reqDoc["sensor_slot_id"] = sensorSlotId;
-  String reqPayload;
-  serializeJson(reqDoc, reqPayload);
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(String(SERVER_URL) + "/api/device/fingerprints/identify");
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("x-device-key", DEVICE_API_KEY);
+    http.setTimeout(4000);
 
-  int code = http.POST(reqPayload);
-  String respBody = http.getString();
-  http.end();
+    StaticJsonDocument<128> reqDoc;
+    reqDoc["device_id"] = DEVICE_ID;
+    reqDoc["sensor_slot_id"] = sensorSlotId;
+    String reqPayload;
+    serializeJson(reqDoc, reqPayload);
 
-  if (code != 200) {
-    Serial.printf("identify failed, HTTP %d: %s\n", code, respBody.c_str());
-    showStatus("Not found", "Try again or resync", COL_ERR, STEP_VERIFY);
-    delay(1500);
-    showIdleScreen();
-    return;
+    int code = http.POST(reqPayload);
+    String respBody = http.getString();
+    http.end();
+
+    if (code == 200) {
+      StaticJsonDocument<512> respDoc;
+      if (!deserializeJson(respDoc, respBody)) {
+        employeeId = respDoc["employee_id"].as<String>();
+        name = respDoc["name"].as<String>();
+        gotOnline = true;
+        cacheEmployeeLocally(sensorSlotId, employeeId, name);
+      }
+    } else if (code > 0) {
+      // Server reachable and gave a real answer (e.g. 404 not enrolled).
+      // Trust it - this is not a "server is down" situation.
+      Serial.printf("identify failed, HTTP %d: %s\n", code, respBody.c_str());
+      showStatus("Not found", "Try again or resync", COL_ERR, STEP_VERIFY);
+      delay(1500);
+      showIdleScreen();
+      return;
+    } else {
+      Serial.printf("identify: server unreachable (code %d), trying offline cache\n", code);
+    }
   }
 
-  StaticJsonDocument<512> respDoc;
-  if (deserializeJson(respDoc, respBody)) {
-    Serial.println("Failed to parse identify response");
-    return;
+  if (!gotOnline) {
+    if (!localIdentify(sensorSlotId, employeeId, name)) {
+      showStatus("Server down", "Not in offline cache", COL_ERR, STEP_VERIFY);
+      delay(1800);
+      showIdleScreen();
+      return;
+    }
+    Serial.printf("Offline identify: slot %d -> %s (%s)\n", sensorSlotId, name.c_str(), employeeId.c_str());
   }
-
-  String employeeId = respDoc["employee_id"].as<String>();
-  String name = respDoc["name"].as<String>();
 
   showStatus("Welcome", name, COL_OK, STEP_VERIFY);
   punchAttendance(employeeId, name);
 }
 
 void punchAttendance(const String& employeeId, const String& name) {
-  StaticJsonDocument<128> doc;
-  doc["employee_id"] = employeeId;
-  doc["device_id"] = DEVICE_ID;
-  String payload;
-  serializeJson(doc, payload);
+  int code = -1;
+  String respBody = "";
 
-  HTTPClient http;
-  http.begin(String(SERVER_URL) + "/api/device/attendance/punch");
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("x-device-key", DEVICE_API_KEY);
-  int code = http.POST(payload);
-  String respBody = http.getString();
-  http.end();
+  if (WiFi.status() == WL_CONNECTED) {
+    StaticJsonDocument<128> doc;
+    doc["employee_id"] = employeeId;
+    doc["device_id"] = DEVICE_ID;
+    String payload;
+    serializeJson(doc, payload);
 
-  Serial.printf("punch -> HTTP %d: %s\n", code, respBody.c_str());
+    HTTPClient http;
+    http.begin(String(SERVER_URL) + "/api/device/attendance/punch");
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("x-device-key", DEVICE_API_KEY);
+    http.setTimeout(4000);
+    code = http.POST(payload);
+    respBody = http.getString();
+    http.end();
+  }
 
   if (code == 200 || code == 201) {
     lastPunchName = name;
     lastPunchTime = currentTimeString();
     showStatus("Punched in!", name + "  " + lastPunchTime, COL_OK, STEP_SYNC);
-  } else {
-    // Try to pull a human-readable reason out of the backend's response
+  } else if (code > 0) {
+    // Server reachable but rejected the punch (e.g. no shift today) -
+    // this is a real answer, not a connectivity problem, so don't queue it.
     String reason = "Check backend";
     StaticJsonDocument<256> errDoc;
     if (!deserializeJson(errDoc, respBody)) {
       const char* errMsg = errDoc["error"];
       if (errMsg != nullptr) reason = String(errMsg);
     }
-
     if (code == 403 && reason.indexOf("No shift") >= 0) {
       showStatus("No shift today", name, COL_WARN, STEP_SYNC);
     } else {
       showStatus("Punch failed", reason, COL_ERR, STEP_SYNC);
     }
+  } else {
+    // WiFi down or server unreachable - save locally so it isn't lost.
+    if (savePendingPunch(employeeId, name)) {
+      lastPunchName = name;
+      lastPunchTime = currentTimeString() + " (offline)";
+      showStatus("Saved offline", name + " - will sync later", COL_WARN, STEP_SYNC);
+    } else {
+      showStatus("Punch LOST", "No SD, server down", COL_ERR, STEP_SYNC);
+    }
   }
+
   delay(1800);
   showIdleScreen();
 }
+
 // ─── Raw template transfer ───────────────────────────────────────────────
 bool downloadTemplateBytes(uint8_t bufferNo, const uint8_t* buf, uint16_t len) {
   uint8_t cmdData[] = { FINGERPRINT_DOWNLOAD, bufferNo };

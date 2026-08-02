@@ -375,7 +375,7 @@ export async function getCutoffDetails(req, res) {
 
   try {
     const data = await fetchAllAttendance(selectedCutoff.start, selectedCutoff.end);
-    const employees = getByEmployee(data);
+    const employees = getByEmployee(data);  
 
     res.json({
       cutoff: selectedCutoff.period,
