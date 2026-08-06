@@ -124,6 +124,7 @@ export const api = {
   },
   setDriverAvailability: (id, availability, reason) => request(`/employees/${id}/driver-availability`, { method: 'PATCH', body: JSON.stringify({ availability, reason }) }),
   reassignDriver: (body) => request('/employees/reassign-driver', { method: 'POST', body: JSON.stringify(body) }),
+  autoReassignDrivers: (date) => request('/employees/auto-reassign-drivers', { method: 'POST', body: JSON.stringify({ date }) }),
   getDriverReassignments: (date) => request(`/employees/reassignments${date ? `?date=${date}` : ''}`),
   deleteDriverReassignment: (id) => request(`/employees/reassignments/${id}`, { method: 'DELETE' }),
 
@@ -141,10 +142,6 @@ export const api = {
   createRecurringStaffingRequirement: (body) => request('/staffing-requirements/recurring', { method: 'POST', body: JSON.stringify(body) }),
   updateStaffingRequirement: (id, body) => request(`/staffing-requirements/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
   deleteStaffingRequirement: (id) => request(`/staffing-requirements/${id}`, { method: 'DELETE' }),
-  // ... existing code ...
 
-  deleteStaffingRequirement: (id) => request(`/staffing-requirements/${id}`, { method: 'DELETE' }),
-
-  // 🟢 ADD THIS LINE RIGHT HERE 🟢
   getPositions: () => request('/positions'),
 };

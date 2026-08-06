@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
-import { Calendar, Plus, Trash2, Clock, AlertTriangle, Truck, Users, UserCheck, ClipboardList, Edit2, CheckCircle2, Filter } from 'lucide-react';
+import { Calendar, Plus, Trash2, Clock, AlertTriangle, Truck, Users, UserCheck, Search, Sun, Moon, ChevronLeft, ChevronRight, ChevronDown } from 'lucide-react';
 import { api } from '../lib/api';
 
 // ─── Date Helpers ──────────────────────────────────────────────────────────────
@@ -27,11 +27,40 @@ function formatTime(t) {
   return `${displayHour}:${m} ${period}`;
 }
 
-function StatusBadge({ status, gap }) {
-  if (status === 'full') return <span className="badge active" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><CheckCircle2 size={12} /> Full</span>;
-  if (status === 'understaffed') return <span className="badge inactive" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: 'var(--danger, #ef4444)' }}><AlertTriangle size={12} /> Short {gap}</span>;
-  return <span className="badge" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>+{Math.abs(gap)} over</span>;
+// Compact "9AM" / "6:30PM" style time, for tight schedule cells
+function shortTime(t) {
+  if (!t) return '';
+  const [h, m] = t.split(':').map(Number);
+  const period = h >= 12 ? 'PM' : 'AM';
+  let hour = h % 12;
+  if (hour === 0) hour = 12;
+  return m === 0 ? `${hour}${period}` : `${hour}:${String(m).padStart(2, '0')}${period}`;
 }
+
+function shortRange(start, end) {
+  if (!start || !end) return '';
+  return `${shortTime(start)}-${shortTime(end)}`;
+}
+
+function initials(name = '') {
+  return name.split(' ').filter(Boolean).slice(0, 2).map(w => w[0].toUpperCase()).join('') || '?';
+}
+
+const AVATAR_COLORS = ['#3b82f6', '#8b5cf6', '#ec4899', '#f59e0b', '#10b981', '#06b6d4', '#f43f5e'];
+function avatarColor(id) {
+  let h = 0;
+  for (const c of String(id)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return AVATAR_COLORS[h % AVATAR_COLORS.length];
+}
+
+function shiftIcon(name = '') {
+  const n = name.toLowerCase();
+  if (n.includes('morning') || n.includes('day')) return Sun;
+  if (n.includes('night')) return Moon;
+  return Clock;
+}
+
+const WEEKDAY_SHORT = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
 // ─── Sub-Components ─────────────────────────────────────────────────────────────
 function ShiftTemplateModal({ templates, onClose, onSave, onDelete, onToast }) {
@@ -51,14 +80,14 @@ function ShiftTemplateModal({ templates, onClose, onSave, onDelete, onToast }) {
   const save = async () => {
     if (!form.name || !form.start_time || !form.end_time) return;
     setSaving(true);
-    try { await onSave(editingId, form); cancelEdit(); } 
-    catch (e) { onToast(e.message, 'error'); } 
+    try { await onSave(editingId, form); cancelEdit(); }
+    catch (e) { onToast(e.message, 'error'); }
     finally { setSaving(false); }
   };
 
   const del = async (t) => {
     if (!confirm(`Delete "${t.name}"?`)) return;
-    try { await onDelete(t.id); } 
+    try { await onDelete(t.id); }
     catch (e) { onToast(e.message, 'error'); }
   };
 
@@ -87,29 +116,53 @@ function ShiftTemplateModal({ templates, onClose, onSave, onDelete, onToast }) {
   );
 }
 
-function AssignShiftModal({ employees, templates, onClose, onAssign, onAssignRecurring, onToast }) {
+function AssignShiftModal({ employees, templates, positions, defaultPosition, onClose, onAssign, onAssignRecurring, onToast }) {
   const [mode, setMode] = useState('single');
   const [entryType, setEntryType] = useState(templates.length === 0 ? 'dayoff' : 'shift');
+  const [positionFilter, setPositionFilter] = useState(defaultPosition || 'all');
   const today = toISODate(new Date());
-  const [form, setForm] = useState({ employee_id: employees[0]?.id || '', shift_template_id: templates[0]?.id || '', date: today, start_date: today, end_date: today, days_of_week: [1, 2, 3, 4, 5], notes: '' });
+
+  const firstMatch = (positionFilter === 'all' ? employees : employees.filter(e => e.position === positionFilter))[0];
+  const [form, setForm] = useState({ employee_id: firstMatch?.id || employees[0]?.id || '', shift_template_id: templates[0]?.id || '', date: today, start_date: today, end_date: today, days_of_week: [1, 2, 3, 4, 5], notes: '' });
   const [saving, setSaving] = useState(false);
+  const [autoRestDays, setAutoRestDays] = useState(true);
   const set = k => e => setForm(f => ({ ...f, [k]: e.target.value }));
   const toggleDay = (d) => setForm(f => ({ ...f, days_of_week: f.days_of_week.includes(d) ? f.days_of_week.filter(x => x !== d) : [...f.days_of_week, d] }));
   const isDayOff = entryType === 'dayoff';
+
+  const employeesByPosition = useMemo(() => {
+    const filtered = positionFilter === 'all' ? employees : employees.filter(e => e.position === positionFilter);
+    const groups = {};
+    filtered.forEach(e => {
+      const key = e.position || 'Unassigned';
+      (groups[key] ||= []).push(e);
+    });
+    return Object.entries(groups).sort(([a], [b]) => a.localeCompare(b));
+  }, [employees, positionFilter]);
 
   const submit = async () => {
     if (!form.employee_id) return onToast('Select an employee', 'error');
     if (!isDayOff && !form.shift_template_id) return onToast('Select a shift', 'error');
     setSaving(true);
     try {
-      if (mode === 'single') await onAssign({ employee_id: form.employee_id, shift_template_id: isDayOff ? null : form.shift_template_id, date: form.date, notes: form.notes || null, is_day_off: isDayOff });
-      else {
+      if (mode === 'single') {
+        await onAssign({ employee_id: form.employee_id, shift_template_id: isDayOff ? null : form.shift_template_id, date: form.date, notes: form.notes || null, is_day_off: isDayOff });
+      } else {
         if (form.days_of_week.length === 0) return onToast('Pick at least one day', 'error');
         await onAssignRecurring({ employee_id: form.employee_id, shift_template_id: isDayOff ? null : form.shift_template_id, start_date: form.start_date, end_date: form.end_date, days_of_week: form.days_of_week, notes: form.notes || null, is_day_off: isDayOff });
+
+        // The days NOT picked above would otherwise stay blank in the schedule —
+        // fill them in as rest days for the same range so every day is accounted for.
+        if (!isDayOff && autoRestDays) {
+          const restDays = [0, 1, 2, 3, 4, 5, 6].filter(d => !form.days_of_week.includes(d));
+          if (restDays.length > 0) {
+            await onAssignRecurring({ employee_id: form.employee_id, shift_template_id: null, start_date: form.start_date, end_date: form.end_date, days_of_week: restDays, notes: null, is_day_off: true });
+          }
+        }
       }
       onToast(isDayOff ? 'Rest day set' : 'Shift assigned', 'success');
       onClose();
-    } catch (e) { onToast(e.message, 'error'); } 
+    } catch (e) { onToast(e.message, 'error'); }
     finally { setSaving(false); }
   };
 
@@ -117,17 +170,91 @@ function AssignShiftModal({ employees, templates, onClose, onAssign, onAssignRec
     <div className="modal-overlay">
       <div className="modal">
         <div className="modal-header"><span className="modal-title">Assign Shift</span><button className="btn btn-icon btn-ghost" onClick={onClose}>✕</button></div>
-        <div className="flex-center gap-2" style={{ marginBottom: 12 }}><button className={`btn btn-sm ${mode === 'single' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setMode('single')}><Calendar size={13} /> Single</button><button className={`btn btn-sm ${mode === 'recurring' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setMode('recurring')}><Clock size={13} /> Recurring</button></div>
-        <div className="flex-center gap-2" style={{ marginBottom: 16 }}><button className={`btn btn-sm ${entryType === 'shift' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setEntryType('shift')} disabled={templates.length === 0}><Clock size={13} /> Shift</button><button className={`btn btn-sm ${entryType === 'dayoff' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setEntryType('dayoff')}>Rest day</button></div>
-        <div className="form-grid">
-          <div className="form-group full"><label>Employee</label><select value={form.employee_id} onChange={set('employee_id')}>{employees.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}</select></div>
-          {!isDayOff && <div className="form-group full"><label>Shift template</label><select value={form.shift_template_id} onChange={set('shift_template_id')}>{templates.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select></div>}
-          {mode === 'single' ? (<div className="form-group full"><label>Date</label><input type="date" value={form.date} onChange={set('date')} /></div>) : (
-            <><div className="form-group"><label>Start</label><input type="date" value={form.start_date} onChange={set('start_date')} /></div><div className="form-group"><label>End</label><input type="date" value={form.end_date} onChange={set('end_date')} /></div><div className="form-group full"><label>Repeat on</label><div className="flex-center gap-2" style={{ flexWrap: 'wrap' }}>{[1,2,3,4,5,6,0].map(d => <button key={d} type="button" className={`btn btn-sm ${form.days_of_week.includes(d) ? 'btn-primary' : 'btn-ghost'}`} onClick={() => toggleDay(d)}>{['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d]}</button>)}</div></div></>
-          )}
-          <div className="form-group full"><label>Notes</label><input value={form.notes} onChange={set('notes')} placeholder="Optional" /></div>
+        <div className="flex-center gap-2" style={{ marginBottom: 12 }}>
+          <button className={`btn btn-sm ${mode === 'single' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setMode('single')}><Calendar size={13} /> Single</button>
+          <button className={`btn btn-sm ${mode === 'recurring' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setMode('recurring')}><Clock size={13} /> Recurring</button>
         </div>
-        <div className="modal-footer"><button className="btn btn-ghost" onClick={onClose}>Cancel</button><button className="btn btn-primary" onClick={submit} disabled={saving}>{saving ? 'Saving…' : 'Assign'}</button></div>
+        <div className="flex-center gap-2" style={{ marginBottom: 16 }}>
+          <button className={`btn btn-sm ${entryType === 'shift' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setEntryType('shift')} disabled={templates.length === 0}><Clock size={13} /> Shift</button>
+          <button className={`btn btn-sm ${entryType === 'dayoff' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setEntryType('dayoff')}>Rest day</button>
+        </div>
+        <div className="form-grid">
+          <div className="form-group full">
+            <label>Filter by position</label>
+            <select value={positionFilter} onChange={e => setPositionFilter(e.target.value)}>
+              <option value="all">All positions</option>
+              {positions.map(p => <option key={p.id} value={p.name}>{p.name}</option>)}
+            </select>
+          </div>
+
+          <div className="form-group full">
+            <label>Employee</label>
+            <select value={form.employee_id} onChange={set('employee_id')}>
+              {employeesByPosition.map(([position, emps]) => (
+                <optgroup key={position} label={position}>
+                  {emps.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
+                </optgroup>
+              ))}
+            </select>
+          </div>
+
+          {!isDayOff && (
+            <div className="form-group full">
+              <label>Shift template</label>
+              <select value={form.shift_template_id} onChange={set('shift_template_id')}>
+                {templates.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+              </select>
+            </div>
+          )}
+
+          {mode === 'single' ? (
+            <div className="form-group full">
+              <label>Date</label>
+              <input type="date" value={form.date} onChange={set('date')} />
+            </div>
+          ) : (
+            <>
+              <div className="form-group">
+                <label>Start</label>
+                <input type="date" value={form.start_date} onChange={set('start_date')} />
+              </div>
+              <div className="form-group">
+                <label>End</label>
+                <input type="date" value={form.end_date} onChange={set('end_date')} />
+              </div>
+              <div className="form-group full">
+                <label>Repeat on</label>
+                <div className="flex-center gap-2" style={{ flexWrap: 'wrap' }}>
+                  {[1, 2, 3, 4, 5, 6, 0].map(d => (
+                    <button key={d} type="button" className={`btn btn-sm ${form.days_of_week.includes(d) ? 'btn-primary' : 'btn-ghost'}`} onClick={() => toggleDay(d)}>
+                      {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d]}
+                    </button>
+                  ))}
+                </div>
+                {!isDayOff && (
+                  <label className="flex-center" style={{ gap: 6, marginTop: 10, fontSize: '0.82rem', cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
+                      checked={autoRestDays}
+                      onChange={e => setAutoRestDays(e.target.checked)}
+                      style={{ width: 16, height: 16, flexShrink: 0, accentColor: 'var(--primary, #3b82f6)' }}
+                    />
+                    Mark the other days in this range as rest days
+                  </label>
+                )}
+              </div>
+            </>
+          )}
+
+          <div className="form-group full">
+            <label>Notes</label>
+            <input value={form.notes} onChange={set('notes')} placeholder="Optional" />
+          </div>
+        </div>
+        <div className="modal-footer">
+          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary" onClick={submit} disabled={saving}>{saving ? 'Saving…' : 'Assign'}</button>
+        </div>
       </div>
     </div>
   );
@@ -143,8 +270,8 @@ function ReplacementModal({ absentDriver, date, onClose, onAssigned, onToast }) 
   }, []);
   const assign = async (replacement) => {
     setAssigningId(replacement.id);
-    try { await api.reassignDriver({ date, original_employee_id: absentDriver.id, replacement_employee_id: replacement.id }); onToast(`${replacement.name} assigned to cover`, 'success'); onAssigned(); onClose(); } 
-    catch (e) { onToast(e.message, 'error'); } 
+    try { await api.reassignDriver({ date, original_employee_id: absentDriver.id, replacement_employee_id: replacement.id }); onToast(`${replacement.name} assigned to cover`, 'success'); onAssigned(); onClose(); }
+    catch (e) { onToast(e.message, 'error'); }
     finally { setAssigningId(null); }
   };
   return (
@@ -168,11 +295,11 @@ function DriverAvailabilityPanel({ onToast }) {
   const [loading, setLoading] = useState(true);
   const [replacing, setReplacing] = useState(null);
   const load = async () => { setLoading(true); try { setDrivers(await api.getFleetDrivers(date)); } catch (e) { onToast(e.message, 'error'); } finally { setLoading(false); } };
-  useEffect(() => { load(); }, [date]);
-  const toggleAvailability = async (driver) => {
-    const next = driver.driver_availability === 'available' ? 'unavailable' : 'available';
-    try { await api.setDriverAvailability(driver.id, next); onToast(`${driver.name} marked ${next}`, 'success'); load(); } catch (e) { onToast(e.message, 'error'); }
-  };
+  useEffect(() => {
+    load();
+    const refresh = window.setInterval(load, 30000);
+    return () => window.clearInterval(refresh);
+  }, [date]);
   return (
     <div className="card" style={{ marginBottom: 20 }}>
       <div className="flex-between" style={{ marginBottom: 12 }}>
@@ -182,14 +309,219 @@ function DriverAvailabilityPanel({ onToast }) {
         <input type="date" value={date} onChange={e => setDate(e.target.value)} style={{ width: 160 }} />
       </div>
       {loading ? <div className="loading"><div className="spinner" /> Loading...</div> : (
-        <div className="table-wrap"><table><thead><tr><th>Name</th><th>Status</th><th></th></tr></thead><tbody>{drivers.map(d => <tr key={d.id}><td>{d.name}</td><td><span className={`badge ${d.effective_availability === 'available' ? 'active' : 'inactive'}`}>{d.effective_availability}</span></td><td><div className="flex-center gap-2"><button className="btn btn-ghost btn-sm" onClick={() => toggleAvailability(d)}>Toggle</button>{d.needs_replacement && <button className="btn btn-primary btn-sm" onClick={() => setReplacing(d)}><UserCheck size={13} /> Replace</button>}</div></td></tr>)}</tbody></table></div>
+        <div className="table-wrap"><table><thead><tr><th>Driver</th><th>Shift</th><th>Clock In</th><th>Status</th><th>Reason</th><th>Coverage</th><th></th></tr></thead><tbody>{drivers.map(d => <tr key={d.id}><td><div style={{ fontWeight: 600 }}>{d.name}</div><div className="text-dim" style={{ fontSize: 11 }}>{d.employee_id}</div></td><td>{d.shift_name || '—'}{d.shift_start && <div className="text-dim" style={{ fontSize: 11 }}>{d.shift_start.slice(0, 5)}</div>}</td><td>{d.clock_in ? d.clock_in.slice(0, 5) : '—'}</td><td><span className={`badge ${d.effective_availability === 'available' ? 'active' : 'inactive'}`}>{d.effective_availability === 'available' ? 'Available' : 'Not Available'}</span></td><td className="text-sm">{d.availability_reason}</td><td className="text-sm">{d.coverage_status === 'active' ? <span style={{ color: 'var(--green)' }}>Covered by {d.replacement_name}</span> : d.coverage_status === 'invalid' ? <span style={{ color: 'var(--danger, #ef4444)' }}>Invalid: {d.coverage_invalid_reason}</span> : '—'}</td><td><button className={`btn btn-sm ${d.needs_replacement ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setReplacing(d)}><UserCheck size={13} /> {d.needs_replacement ? 'Replace' : 'Override'}</button></td></tr>)}</tbody></table></div>
       )}
       {replacing && <ReplacementModal absentDriver={replacing} date={date} onClose={() => setReplacing(null)} onAssigned={load} onToast={onToast} />}
     </div>
   );
 }
 
-// ─── MAIN SCHEDULE PAGE (MERGED VIEW - LIST + GRID) ──────────────────────────
+// ─── Requirements Matrix (compact, one row per shift type) ─────────────────────
+function RequirementsMatrix({ positionName, rows, dates, onCellClick }) {
+  return (
+    <div style={{ marginBottom: 20 }}>
+      <div className="text-dim text-sm" style={{ marginBottom: 8, fontWeight: 600 }}>{positionName} requirements this week</div>
+      <div className="table-wrap">
+        <table className="req-matrix" style={{ width: '100%', borderCollapse: 'separate', borderSpacing: '6px' }}>
+          <thead>
+            <tr>
+              <th style={{ textAlign: 'left', padding: '4px 8px', minWidth: 100 }}></th>
+              {dates.map(date => {
+                const d = new Date(date + 'T00:00:00');
+                return (
+                  <th key={date} style={{ textAlign: 'center', padding: '4px 8px', fontWeight: 600, fontSize: '0.75rem' }}>
+                    <span style={{ color: 'var(--text-muted)' }}>{WEEKDAY_SHORT[(d.getDay() + 6) % 7]} </span>{d.getDate()}
+                  </th>
+                );
+              })}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(row => {
+              const Icon = shiftIcon(row.name);
+              return (
+                <tr key={row.id}>
+                  <td style={{ padding: '4px 8px' }}>
+                    <span className="flex-center" style={{ gap: 6, fontSize: '0.85rem' }}>
+                      <Icon size={13} style={{ color: row.color }} /> {row.name}
+                    </span>
+                  </td>
+                  {dates.map(date => {
+                    const cell = row.cells[date];
+                    if (!cell) {
+                      return (
+                        <td key={date} style={{ textAlign: 'center', padding: 0 }}>
+                          <button
+                            className="btn-ghost"
+                            onClick={() => onCellClick({ position_id: row.position_id, shift_template_id: row.id, date, required_count: 1, notes: '' })}
+                            style={{ width: '100%', minWidth: 56, padding: '6px 4px', borderRadius: 6, border: '1px dashed var(--border)', color: 'var(--text-muted)', background: 'transparent', cursor: 'pointer', fontSize: '0.8rem' }}
+                            title="Click to add a requirement"
+                          >—</button>
+                        </td>
+                      );
+                    }
+                    const full = cell.status === 'full';
+                    return (
+                      <td key={date} style={{ textAlign: 'center', padding: 0 }}>
+                        <button
+                          onClick={() => onCellClick(cell)}
+                          title={`${cell.assigned_count}/${cell.required_count} filled`}
+                          style={{
+                            width: '100%', minWidth: 56, padding: '6px 4px', borderRadius: 6, border: 'none', cursor: 'pointer', fontSize: '0.8rem', fontWeight: 600,
+                            background: full ? 'rgba(16,185,129,0.15)' : 'rgba(239,68,68,0.15)',
+                            color: full ? 'var(--green, #10b981)' : 'var(--danger, #ef4444)',
+                          }}
+                        >{cell.assigned_count}/{cell.required_count}</button>
+                      </td>
+                    );
+                  })}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <p className="text-dim" style={{ fontSize: '0.72rem', marginTop: 6 }}>One row per shift type. Dashed cells mean no requirement set — click to add one for that day.</p>
+    </div>
+  );
+}
+
+// ─── Employee schedule list (compact, single position) ─────────────────────────
+function EmployeeScheduleGroup({ position, employees, dates, assignmentMap, onRemove }) {
+  const scheduledCount = employees.filter(e => dates.some(date => assignmentMap[date]?.[e.id])).length;
+  return (
+    <div>
+      <div className="text-dim text-sm" style={{ marginBottom: 8, fontWeight: 600 }}>
+        {position} · {employees.length} {employees.length === 1 ? 'person' : 'people'}, {scheduledCount} scheduled
+      </div>
+      <div className="table-wrap">
+        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.85rem' }}>
+          <thead>
+            <tr>
+              <th style={{ textAlign: 'left', padding: '6px 8px', minWidth: 180 }}></th>
+              {dates.map(date => {
+                const d = new Date(date + 'T00:00:00');
+                return <th key={date} style={{ textAlign: 'center', padding: '6px 4px', fontSize: '0.7rem', color: 'var(--text-muted)', fontWeight: 600 }}>{WEEKDAY_SHORT[(d.getDay() + 6) % 7]} {d.getDate()}</th>;
+              })}
+            </tr>
+          </thead>
+          <tbody>
+            {employees.map(emp => (
+              <tr key={emp.id} style={{ borderTop: '1px solid var(--border-light)' }}>
+                <td style={{ padding: '8px' }}>
+                  <div className="flex-center" style={{ gap: 8 }}>
+                    <span style={{ width: 26, height: 26, borderRadius: '50%', background: avatarColor(emp.id), color: '#fff', fontSize: '0.7rem', fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>{initials(emp.name)}</span>
+                    <div>
+                      <div style={{ fontWeight: 600 }}>{emp.name}</div>
+                      <div className="text-dim" style={{ fontSize: '0.7rem' }}>{emp.employee_id}</div>
+                    </div>
+                  </div>
+                </td>
+                {dates.map(date => {
+                  const a = assignmentMap[date]?.[emp.id];
+                  return (
+                    <td key={date} style={{ textAlign: 'center', padding: '4px' }}>
+                      {!a ? (
+                        <span style={{ color: 'var(--text-muted)' }}>—</span>
+                      ) : a.is_day_off ? (
+                        <span className="badge inactive" style={{ fontSize: '0.68rem', padding: '3px 6px', cursor: 'pointer' }} onClick={() => onRemove(a)} title="Click to remove">Rest</span>
+                      ) : (
+                        <span
+                          onClick={() => onRemove(a)}
+                          title="Click to remove"
+                          style={{ display: 'inline-block', padding: '3px 6px', borderRadius: 5, fontSize: '0.7rem', fontWeight: 700, color: '#fff', background: a.shift_templates?.color || '#3b82f6', cursor: 'pointer' }}
+                        >{shortRange(a.shift_templates?.start_time, a.shift_templates?.end_time)}</span>
+                      )}
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ─── Position Picker ─────────────────────────────────────────────────────────
+// Up to `threshold` positions: simple tabs, quick to scan and one click away.
+// Beyond that: tabs stop scaling (wrapping / horizontal scrolling gets messy),
+// so switch to a compact searchable dropdown instead — same pattern Deputy /
+// 7shifts use once a business has more than a handful of roles or departments.
+function PositionPicker({ tabs, selected, onSelect, threshold = 6 }) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+
+  if (tabs.length === 0) return null;
+
+  if (tabs.length <= threshold) {
+    return (
+      <div className="flex-center gap-2" style={{ padding: '12px 20px', borderBottom: '1px solid var(--border)', flexWrap: 'wrap', overflowX: 'auto' }}>
+        {tabs.map(t => (
+          <button
+            key={t.name}
+            className={`btn btn-sm ${selected === t.name ? 'btn-primary' : 'btn-ghost'}`}
+            onClick={() => onSelect(t.name)}
+            style={{ whiteSpace: 'nowrap' }}
+          >
+            {t.name} <span style={{ opacity: 0.7, marginLeft: 4 }}>({t.count})</span>
+          </button>
+        ))}
+      </div>
+    );
+  }
+
+  const filtered = tabs.filter(t => t.name.toLowerCase().includes(query.trim().toLowerCase()));
+
+  return (
+    <div style={{ padding: '12px 20px', borderBottom: '1px solid var(--border)', position: 'relative' }}>
+      <button
+        className="btn btn-ghost btn-sm"
+        onClick={() => setOpen(o => !o)}
+        style={{ minWidth: 220, justifyContent: 'space-between', display: 'inline-flex', alignItems: 'center' }}
+      >
+        <span>{selected || 'Select position'} {selected && <span className="text-dim">({tabs.find(t => t.name === selected)?.count})</span>}</span>
+        <ChevronDown size={14} />
+      </button>
+
+      {open && (
+        <>
+          <div onClick={() => { setOpen(false); setQuery(''); }} style={{ position: 'fixed', inset: 0, zIndex: 9 }} />
+          <div className="card" style={{ position: 'absolute', top: '100%', left: 20, marginTop: 4, width: 260, zIndex: 10, padding: 8, maxHeight: 320, overflowY: 'auto', boxShadow: '0 8px 24px rgba(0,0,0,0.35)' }}>
+            <div style={{ position: 'relative', marginBottom: 8 }}>
+              <Search size={13} style={{ position: 'absolute', left: 8, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
+              <input
+                autoFocus
+                value={query}
+                onChange={e => setQuery(e.target.value)}
+                placeholder="Search positions"
+                style={{ width: '100%', paddingLeft: 26, fontSize: '0.85rem' }}
+              />
+            </div>
+            {filtered.length === 0 ? (
+              <div className="text-dim text-sm" style={{ padding: '6px 4px' }}>No positions match.</div>
+            ) : filtered.map(t => (
+              <button
+                key={t.name}
+                onClick={() => { onSelect(t.name); setOpen(false); setQuery(''); }}
+                className="btn btn-ghost btn-sm"
+                style={{
+                  width: '100%', justifyContent: 'space-between', display: 'flex', marginBottom: 2,
+                  background: selected === t.name ? 'var(--surface-hover, rgba(255,255,255,0.08))' : 'transparent'
+                }}
+              >
+                <span>{t.name}</span><span className="text-dim">({t.count})</span>
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─── MAIN SCHEDULE PAGE ──────────────────────────────────────────────────────
 export default function SchedulePage({ onToast }) {
   const [employees, setEmployees] = useState([]);
   const [templates, setTemplates] = useState([]);
@@ -200,13 +532,19 @@ export default function SchedulePage({ onToast }) {
   const [loading, setLoading] = useState(true);
   const [showTemplates, setShowTemplates] = useState(false);
   const [showAssign, setShowAssign] = useState(false);
-  
+
   // Requirement Modal State
   const [showReqModal, setShowReqModal] = useState(false);
   const [editingReq, setEditingReq] = useState(null);
+  const [reqDays, setReqDays] = useState([]); // dates a NEW requirement should be created for (defaults to the whole visible week)
 
-  // 🟢 NEW: Position Filter State
-  const [positionFilter, setPositionFilter] = useState('all');
+  // Position tab (single-select — one role/department in view at a time, like a real shift-planning tool)
+  const [selectedPosition, setSelectedPosition] = useState(null);
+
+  // Employee list search / filter state
+  const [search, setSearch] = useState('');
+  const [showScheduled, setShowScheduled] = useState(false);
+  const [showNoShifts, setShowNoShifts] = useState(false);
 
   const [range, setRange] = useState(() => {
     const start = startOfWeek(new Date());
@@ -231,32 +569,32 @@ export default function SchedulePage({ onToast }) {
       setAssignments(sched);
       setCoverage(cov.coverage);
       setTotals(cov.totals);
-    } catch (e) { onToast(e.message, 'error'); } 
+    } catch (e) { onToast(e.message, 'error'); }
     finally { setLoading(false); }
   };
 
   useEffect(() => { load(); }, [range.start, range.end]);
 
   const saveTemplate = async (id, form) => {
-    if (id) { const updated = await api.updateShiftTemplate(id, form); setTemplates(ts => ts.map(t => t.id === id ? updated : t)); } 
+    if (id) { const updated = await api.updateShiftTemplate(id, form); setTemplates(ts => ts.map(t => t.id === id ? updated : t)); }
     else { const created = await api.createShiftTemplate(form); setTemplates(ts => [...ts, created]); }
     onToast('Template saved', 'success');
   };
   const deleteTemplate = async (id) => { await api.deleteShiftTemplate(id); setTemplates(ts => ts.filter(t => t.id !== id)); onToast('Template deleted', 'success'); };
 
-  const removeAssignment = async (id) => {
+  const removeAssignment = async (assignment) => {
     if (!confirm('Remove this assignment?')) return;
-    try { await api.deleteShiftAssignment(id); setAssignments(a => a.filter(x => x.id !== id)); onToast('Assignment removed', 'success'); } 
+    try { await api.deleteShiftAssignment(assignment.id); setAssignments(a => a.filter(x => x.id !== assignment.id)); onToast('Assignment removed', 'success'); }
     catch (e) { onToast(e.message, 'error'); }
   };
 
   const removeRequirement = async (row) => {
     if (!confirm(`Remove requirement for ${row.positions?.name || 'position'}?`)) return;
-    try { await api.deleteStaffingRequirement(row.id); onToast('Requirement removed', 'success'); load(); } 
+    try { await api.deleteStaffingRequirement(row.id); onToast('Requirement removed', 'success'); load(); }
     catch (e) { onToast(e.message, 'error'); }
   };
 
-  // ─── CALENDAR GRID LOGIC ──────────────────────────────────────────────────────
+  // ─── DATE RANGE ────────────────────────────────────────────────────────────
   const datesInRange = useMemo(() => {
     const dates = [];
     let current = new Date(range.start);
@@ -272,24 +610,76 @@ export default function SchedulePage({ onToast }) {
   }, [assignments]);
 
   const activeEmployees = useMemo(() => employees.filter(e => e.status === 'active'), [employees]);
-  const totalShifts = assignments.filter(a => !a.is_day_off).length;
-  const totalRestDays = assignments.filter(a => a.is_day_off).length;
+
+  // ─── POSITION TABS ─────────────────────────────────────────────────────────
+  // Real-world shift tools (Deputy, When I Work, 7shifts) show one role/department at a
+  // time rather than one long stacked list — so build a tab per position with a headcount.
+  const positionTabs = useMemo(() => {
+    const counts = {};
+    activeEmployees.forEach(e => { const key = e.position || 'Unassigned'; counts[key] = (counts[key] || 0) + 1; });
+    return Object.entries(counts)
+      .sort(([a], [b]) => (a === 'Unassigned') - (b === 'Unassigned') || a.localeCompare(b))
+      .map(([name, count]) => ({ name, count }));
+  }, [activeEmployees]);
+
+  useEffect(() => {
+    if (positionTabs.length === 0) { setSelectedPosition(null); return; }
+    if (!selectedPosition || !positionTabs.some(t => t.name === selectedPosition)) {
+      setSelectedPosition(positionTabs[0].name);
+    }
+  }, [positionTabs]);
+
+  // Positions table can contain rows nobody is actually staffed under (roles created
+  // then abandoned) and occasional duplicate names (same role added twice). Dropdowns
+  // that let you pick a position to assign/require should only offer ones that are
+  // actually in use — i.e. at least one employee currently has that position — and
+  // only once each.
+  const activePositions = useMemo(() => {
+    const usedNames = new Set(positionTabs.map(t => t.name));
+    const seen = new Set();
+    return positions.filter(p => {
+      if (!usedNames.has(p.name) || seen.has(p.name)) return false;
+      seen.add(p.name);
+      return true;
+    });
+  }, [positions, positionTabs]);
 
   // ─── REQUIREMENT MODAL LOGIC ──────────────────────────────────────────────────
+  // New requirements default to covering the whole visible week in one step —
+  // the person can then adjust or remove individual days later by clicking that
+  // day's cell in the matrix, instead of having to add each day one at a time.
+  const openReqModal = (prefill) => {
+    setEditingReq(prefill);
+    if (!prefill?.id) setReqDays(datesInRange);
+    setShowReqModal(true);
+  };
+
+  const toggleReqDay = (date) => setReqDays(days => days.includes(date) ? days.filter(x => x !== date) : [...days, date]);
+
   const saveRequirement = async () => {
     try {
       if (editingReq?.id) {
         await api.updateStaffingRequirement(editingReq.id, { required_count: editingReq.required_count, notes: editingReq.notes });
+        onToast('Requirement saved', 'success');
       } else {
-        await api.createStaffingRequirement({
+        if (reqDays.length === 0) return onToast('Pick at least one day', 'error');
+        const existingDates = new Set(
+          coverage
+            .filter(c => c.position_id === editingReq.position_id && c.shift_template_id === editingReq.shift_template_id)
+            .map(c => c.date)
+        );
+        const toCreate = reqDays.filter(d => !existingDates.has(d));
+        if (toCreate.length === 0) return onToast('Those days already have a requirement set', 'error');
+        await Promise.all(toCreate.map(date => api.createStaffingRequirement({
           position_id: editingReq.position_id,
           shift_template_id: editingReq.shift_template_id,
-          date: editingReq.date,
+          date,
           required_count: editingReq.required_count,
           notes: editingReq.notes
-        });
+        })));
+        const skipped = reqDays.length - toCreate.length;
+        onToast(skipped > 0 ? `Added for ${toCreate.length} day(s) — ${skipped} already had a requirement` : `Added for ${toCreate.length} day(s)`, 'success');
       }
-      onToast('Requirement saved', 'success');
       setShowReqModal(false);
       load();
     } catch (e) { onToast(e.message, 'error'); }
@@ -301,24 +691,46 @@ export default function SchedulePage({ onToast }) {
     setRange({ start: toISODate(s), end: toISODate(e) });
   };
 
-  // 🟢 FILTERED DATA for Requirements
+  const rangeLabel = useMemo(() => {
+    const s = new Date(range.start + 'T00:00:00'), e = new Date(range.end + 'T00:00:00');
+    const opts = { month: 'short', day: 'numeric' };
+    const year = e.getFullYear();
+    return `${s.toLocaleDateString('en-US', opts)} – ${e.toLocaleDateString('en-US', opts)}, ${year}`;
+  }, [range]);
+
+  // Requirements + roster filtered down to just the selected position tab
   const filteredCoverage = useMemo(() => {
-    if (positionFilter === 'all') return coverage;
-    return coverage.filter(c => c.positions?.name === positionFilter);
-  }, [coverage, positionFilter]);
+    if (!selectedPosition) return [];
+    return coverage.filter(c => (c.positions?.name || 'Unassigned') === selectedPosition);
+  }, [coverage, selectedPosition]);
 
-  // 🟢 FILTERED DATA for Employees Grid
-  const filteredEmployees = useMemo(() => {
-    if (positionFilter === 'all') return activeEmployees;
-    return activeEmployees.filter(e => e.position === positionFilter);
-  }, [activeEmployees, positionFilter]);
-
-  // Group coverage by date for the list view
-  const groupedCoverage = useMemo(() => {
-    const map = {};
-    filteredCoverage.forEach(c => { (map[c.date] ||= []).push(c); });
-    return Object.entries(map).sort(([a], [b]) => a.localeCompare(b));
+  const requirementRows = useMemo(() => {
+    const rows = {};
+    filteredCoverage.forEach(c => {
+      const shiftId = c.shift_template_id;
+      if (!rows[shiftId]) rows[shiftId] = { id: shiftId, position_id: c.position_id, name: c.roles?.name || 'Shift', color: c.roles?.color || '#3b82f6', cells: {} };
+      rows[shiftId].cells[c.date] = c;
+    });
+    return Object.values(rows);
   }, [filteredCoverage]);
+
+  const positionEmployees = useMemo(() => {
+    if (!selectedPosition) return [];
+    let list = activeEmployees.filter(e => (e.position || 'Unassigned') === selectedPosition);
+    if (search.trim()) {
+      const q = search.trim().toLowerCase();
+      list = list.filter(e => e.name.toLowerCase().includes(q) || (e.employee_id || '').toLowerCase().includes(q));
+    }
+    if (showScheduled || showNoShifts) {
+      list = list.filter(e => {
+        const hasShift = datesInRange.some(date => assignmentMap[date]?.[e.id]);
+        return (showScheduled && hasShift) || (showNoShifts && !hasShift);
+      });
+    }
+    return list;
+  }, [activeEmployees, selectedPosition, search, showScheduled, showNoShifts, datesInRange, assignmentMap]);
+
+  const currentPositionId = activePositions.find(p => p.name === selectedPosition)?.id || activePositions[0]?.id || '';
 
   return (
     <div className="page">
@@ -326,7 +738,7 @@ export default function SchedulePage({ onToast }) {
       <div className="flex-between" style={{ marginBottom: 24 }}>
         <div>
           <h2 style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.5px' }}>Shift &amp; Schedule Management</h2>
-          <p className="text-dim text-sm" style={{ marginTop: 4 }}>{totalShifts} shift(s) · {totalRestDays} rest day(s) scheduled</p>
+          <p className="text-dim text-sm" style={{ marginTop: 4 }}>{assignments.filter(a => !a.is_day_off).length} shift(s) · {assignments.filter(a => a.is_day_off).length} rest day(s) scheduled</p>
         </div>
         <div className="flex-center gap-2">
           <button className="btn btn-ghost" onClick={() => setShowTemplates(true)}><Clock size={14} /> Manage Templates</button>
@@ -337,167 +749,121 @@ export default function SchedulePage({ onToast }) {
       {/* Driver Availability (Separate Card) */}
       <DriverAvailabilityPanel onToast={onToast} />
 
-      {/* 🌟 MERGED PANEL (Requirements LIST + Schedule GRID) */}
+      {/* MERGED PANEL */}
       <div className="card">
-        {/* Panel Controls (Date range + Actions + Filter) */}
-        <div className="flex-between" style={{ padding: '16px 20px', borderBottom: '1px solid var(--border)', marginBottom: 0, flexWrap: 'wrap', gap: '12px' }}>
+        {/* Week controls + totals */}
+        <div className="flex-between" style={{ padding: '16px 20px', borderBottom: '1px solid var(--border)', flexWrap: 'wrap', gap: '12px' }}>
           <div className="flex-center gap-2">
-            <button className="btn btn-ghost btn-sm" onClick={() => shiftWeek(-1)}>← Prev week</button>
-            <span className="mono text-sm">{range.start} → {range.end}</span>
-            <button className="btn btn-ghost btn-sm" onClick={() => shiftWeek(1)}>Next week →</button>
+            <button className="btn btn-icon btn-ghost btn-sm" onClick={() => shiftWeek(-1)}><ChevronLeft size={14} /></button>
+            <span style={{ fontWeight: 600 }}>{rangeLabel}</span>
+            <button className="btn btn-icon btn-ghost btn-sm" onClick={() => shiftWeek(1)}><ChevronRight size={14} /></button>
           </div>
           <div className="flex-center gap-2" style={{ flexWrap: 'wrap' }}>
-            <span className="text-dim text-sm">{totals.total_assigned}/{totals.total_required} filled</span>
+            <span className="text-dim text-sm">{totals.total_assigned} of {totals.total_required} slots filled</span>
             {totals.understaffed_slots > 0 && (
               <span className="flex-center" style={{ gap: 6, color: 'var(--danger, #ef4444)' }}><AlertTriangle size={14} /> {totals.understaffed_slots} short-staffed</span>
             )}
-            
-            {/* 🟢 NEW DROPDOWN FILTER */}
-            <div className="flex-center" style={{ gap: 6 }}>
-              <Filter size={14} className="text-dim" />
-              <select 
-                value={positionFilter} 
-                onChange={e => setPositionFilter(e.target.value)}
-                style={{ padding: '4px 8px', fontSize: '0.85rem', borderRadius: '4px', border: '1px solid var(--border)' }}
-              >
-                <option value="all">All Positions</option>
-                {positions.map(p => (
-                  <option key={p.id} value={p.name}>{p.name}</option>
-                ))}
-              </select>
-            </div>
-
-            <button 
-              className="btn btn-primary btn-sm" 
-              onClick={() => { 
-                setEditingReq({ 
-                  position_id: positions[0]?.id || '', 
-                  shift_template_id: templates[0]?.id || '', 
-                  date: toISODate(new Date()), 
-                  required_count: 1, 
-                  notes: '' 
-                }); 
-                setShowReqModal(true); 
-              }} 
-              disabled={positions.length === 0 || templates.length === 0}
+            <button
+              className="btn btn-primary btn-sm"
+              onClick={() => openReqModal({
+                position_id: currentPositionId,
+                shift_template_id: templates[0]?.id || '',
+                required_count: 1,
+                notes: ''
+              })}
+              disabled={activePositions.length === 0 || templates.length === 0}
             >
-              <Plus size={13} /> Set Requirement
+              <Plus size={13} /> Add requirement
             </button>
           </div>
         </div>
 
+        {/* Position picker — tabs for a few positions, searchable dropdown once there are many */}
+        <PositionPicker tabs={positionTabs} selected={selectedPosition} onSelect={setSelectedPosition} />
+
         {loading ? (
           <div className="loading" style={{ padding: 40 }}><div className="spinner" /> Loading…</div>
+        ) : !selectedPosition ? (
+          <div className="empty-state" style={{ padding: 40 }}><Users size={32} /><p>No active employees yet.</p></div>
         ) : (
-          <>
-            {/* 1. STAFFING REQUIREMENTS LIST */}
-            <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border-light)' }}>
-              <div className="flex-center" style={{ gap: 8, marginBottom: 12 }}>
-                <ClipboardList size={16} />
-                <strong>Staffing Requirements</strong>
-                {positionFilter !== 'all' && <span className="badge active" style={{ fontSize: '0.7rem' }}>Filtered: {positionFilter}</span>}
+          <div style={{ padding: '16px 20px' }}>
+            {/* 1. REQUIREMENTS MATRIX for the selected position */}
+            {requirementRows.length === 0 ? (
+              <div className="empty-state" style={{ padding: '12px 0 24px' }}>
+                <p className="text-dim text-sm">No staffing requirements set for {selectedPosition} this week yet.</p>
               </div>
-              
-              {filteredCoverage.length === 0 ? (
-                <div className="empty-state" style={{ padding: '20px 0' }}>
-                  <ClipboardList size={28} />
-                  <p>{positionFilter === 'all' ? 'No staffing requirements set for this range' : `No staffing requirements found for "${positionFilter}"`}</p>
+            ) : (
+              <RequirementsMatrix
+                positionName={selectedPosition}
+                rows={requirementRows}
+                dates={datesInRange}
+                onCellClick={openReqModal}
+              />
+            )}
+
+            {/* 2. EMPLOYEE LIST for the selected position */}
+            <div style={{ marginTop: 8 }}>
+              <div className="flex-between" style={{ marginBottom: 14, flexWrap: 'wrap', gap: 10 }}>
+                <div style={{ position: 'relative', flex: '1 1 220px', maxWidth: 320 }}>
+                  <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
+                  <input
+                    value={search}
+                    onChange={e => setSearch(e.target.value)}
+                    placeholder="Search employees"
+                    style={{ width: '100%', paddingLeft: 30 }}
+                  />
                 </div>
+                <div className="flex-center gap-2" style={{ fontSize: '0.82rem' }}>
+                  <label className="flex-center" style={{ gap: 6, cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
+                      checked={showScheduled}
+                      onChange={e => setShowScheduled(e.target.checked)}
+                      style={{ width: 16, height: 16, flexShrink: 0, accentColor: 'var(--primary, #3b82f6)' }}
+                    /> Scheduled
+                  </label>
+                  <label className="flex-center" style={{ gap: 6, cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
+                      checked={showNoShifts}
+                      onChange={e => setShowNoShifts(e.target.checked)}
+                      style={{ width: 16, height: 16, flexShrink: 0, accentColor: 'var(--primary, #3b82f6)' }}
+                    /> No shifts
+                  </label>
+                </div>
+              </div>
+
+              {positionEmployees.length === 0 ? (
+                <div className="empty-state"><Users size={32} /><p>No employees match this filter.</p></div>
               ) : (
-                groupedCoverage.map(([date, rows]) => (
-                  <div key={date} style={{ marginBottom: 16 }}>
-                    <div className="flex-center" style={{ gap: 8, marginBottom: 6 }}>
-                      <strong style={{ fontSize: '0.9rem' }}>{new Date(date + 'T00:00:00').toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' })}</strong>
-                      <span className="text-dim text-sm">{date}</span>
-                    </div>
-                    <div className="table-wrap">
-                      <table>
-                        <thead><tr><th>Position</th><th>Shift</th><th>Required</th><th>Assigned</th><th>Status</th><th></th></tr></thead>
-                        <tbody>
-                          {rows.map(r => (
-                            <tr key={r.id}>
-                              <td><strong>{r.positions?.name || '—'}</strong></td>
-                              <td><span className="flex-center" style={{ gap: 8 }}><span style={{ width: 10, height: 10, borderRadius: '50%', background: r.roles?.color || '#3b82f6', display: 'inline-block' }} /> {r.roles?.name || '—'}</span></td>
-                              <td className="mono text-sm">{r.required_count}</td>
-                              <td className="mono text-sm" title={r.assigned_employees.map(e => e.name).join(', ') || undefined}>{r.assigned_count}</td>
-                              <td><StatusBadge status={r.status} gap={r.gap} /></td>
-                              <td>
-                                <div className="flex-center gap-2">
-                                  <button className="btn btn-icon btn-ghost btn-sm" onClick={() => { setEditingReq(r); setShowReqModal(true); }} title="Edit"><Edit2 size={13} /></button>
-                                  <button className="btn btn-icon btn-danger btn-sm" onClick={() => removeRequirement(r)} title="Remove"><Trash2 size={13} /></button>
-                                </div>
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-                ))
+                <EmployeeScheduleGroup
+                  position={selectedPosition}
+                  employees={positionEmployees}
+                  dates={datesInRange}
+                  assignmentMap={assignmentMap}
+                  onRemove={removeAssignment}
+                />
               )}
             </div>
-
-            {/* 2. EMPLOYEE SCHEDULE GRID */}
-            <div style={{ padding: '16px 20px' }}>
-              {filteredEmployees.length === 0 ? (
-                <div className="empty-state"><Calendar size={36} /><p>{positionFilter === 'all' ? 'No active employees found.' : `No active employees with position "${positionFilter}" found.`}</p></div>
-              ) : assignments.length === 0 ? (
-                <div className="empty-state"><Calendar size={36} /><p>No shifts or rest days scheduled in this range.</p></div>
-              ) : (
-                <div className="table-wrap">
-                  <table className="schedule-grid" style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.9rem' }}>
-                    <thead>
-                      <tr>
-                        <th style={{ textAlign: 'left', padding: '12px 16px', borderBottom: '2px solid var(--border)', minWidth: '160px' }}>Employee</th>
-                        {datesInRange.map(date => (
-                          <th key={date} style={{ textAlign: 'center', padding: '8px', borderBottom: '2px solid var(--border)', minWidth: '80px' }}>
-                            <div style={{ fontWeight: 600, fontSize: '0.75rem' }}>{new Date(date + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'short' })}</div>
-                            <div style={{ fontSize: '0.65rem', color: 'var(--text-muted)' }}>{new Date(date + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</div>
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {filteredEmployees.map(emp => (
-                        <tr key={emp.id} style={{ borderBottom: '1px solid var(--border-light)' }}>
-                          <td style={{ padding: '8px 16px', fontWeight: 500 }}>
-                            {emp.name}
-                            <div style={{ fontSize: '0.7rem', fontWeight: 400, color: 'var(--text-muted)' }}>{emp.employee_id} · {emp.position || '—'}</div>
-                          </td>
-                          {datesInRange.map(date => {
-                            const assignment = assignmentMap[date]?.[emp.id];
-                            const isDayOff = assignment?.is_day_off;
-                            const shiftData = assignment?.shift_templates;
-
-                            let cellContent;
-                            let cellStyle = { padding: '8px', textAlign: 'center', verticalAlign: 'middle' };
-
-                            if (!assignment) cellContent = <span style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>—</span>;
-                            else if (isDayOff) cellContent = <span className="badge inactive" style={{ display: 'inline-block', padding: '4px 10px', borderRadius: '4px', fontSize: '0.75rem' }}>Rest day</span>;
-                            else cellContent = (
-                              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', backgroundColor: shiftData?.color || '#3b82f6', color: '#fff', borderRadius: '6px', padding: '6px 4px', position: 'relative' }}>
-                                <strong style={{ fontSize: '0.75rem', marginBottom: '2px' }}>{shiftData?.name || 'Shift'}</strong>
-                                <span style={{ fontSize: '0.65rem', opacity: 0.9 }}>{formatTime(shiftData?.start_time)} - {formatTime(shiftData?.end_time)}</span>
-                                <button className="btn btn-icon btn-danger" style={{ position: 'absolute', top: '-6px', right: '-6px', width: '18px', height: '18px', padding: 0, fontSize: '10px', borderRadius: '50%' }} onClick={() => removeAssignment(assignment.id)}><Trash2 size={10} /></button>
-                              </div>
-                            );
-                            return <td key={date} style={cellStyle}>{cellContent}</td>;
-                          })}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
-          </>
+          </div>
         )}
       </div>
 
       {/* Modals */}
       {showTemplates && <ShiftTemplateModal templates={templates} onClose={() => setShowTemplates(false)} onSave={saveTemplate} onDelete={deleteTemplate} onToast={onToast} />}
-      {showAssign && <AssignShiftModal employees={employees} templates={templates} onClose={() => setShowAssign(false)} onAssign={async (b) => { await api.assignShift(b); load(); }} onAssignRecurring={async (b) => { await api.assignRecurringShift(b); load(); }} onToast={onToast} />}
-      
+      {showAssign && (
+        <AssignShiftModal
+          employees={employees}
+          templates={templates}
+          positions={activePositions}
+          defaultPosition={selectedPosition}
+          onClose={() => setShowAssign(false)}
+          onAssign={async (b) => { await api.assignShift(b); load(); }}
+          onAssignRecurring={async (b) => { await api.assignRecurringShift(b); load(); }}
+          onToast={onToast}
+        />
+      )}
+
       {showReqModal && (
         <div className="modal-overlay">
           <div className="modal">
@@ -509,7 +875,7 @@ export default function SchedulePage({ onToast }) {
               <div className="form-group full">
                 <label>Position</label>
                 <select value={editingReq?.position_id || ''} onChange={e => setEditingReq(r => ({ ...r, position_id: e.target.value }))} disabled={!!editingReq?.id}>
-                  {positions.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                  {activePositions.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
                 </select>
               </div>
               <div className="form-group full">
@@ -518,15 +884,39 @@ export default function SchedulePage({ onToast }) {
                   {templates.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
                 </select>
               </div>
-              <div className="form-group">
-                <label>Date</label>
-                <input 
-                  type="date" 
-                  value={editingReq?.date || toISODate(new Date())} 
-                  onChange={e => setEditingReq(r => ({ ...r, date: e.target.value }))} 
-                  disabled={!!editingReq?.id} 
-                />
-              </div>
+              {editingReq?.id ? (
+                <div className="form-group">
+                  <label>Date</label>
+                  <input type="date" value={editingReq.date} disabled />
+                </div>
+              ) : (
+                <div className="form-group full">
+                  <label>Apply to</label>
+                  <div className="flex-center gap-2" style={{ marginBottom: 8 }}>
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => setReqDays(datesInRange)}>Whole week</button>
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => setReqDays([])}>Clear</button>
+                  </div>
+                  <div className="flex-center gap-2" style={{ flexWrap: 'wrap' }}>
+                    {datesInRange.map(date => {
+                      const d = new Date(date + 'T00:00:00');
+                      const active = reqDays.includes(date);
+                      return (
+                        <button
+                          key={date}
+                          type="button"
+                          className={`btn btn-sm ${active ? 'btn-primary' : 'btn-ghost'}`}
+                          onClick={() => toggleReqDay(date)}
+                        >
+                          {WEEKDAY_SHORT[(d.getDay() + 6) % 7]} {d.getDate()}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <p className="text-dim" style={{ fontSize: '0.72rem', marginTop: 6 }}>
+                    Creates one requirement per selected day. Days that already have one are skipped — edit those from the matrix instead.
+                  </p>
+                </div>
+              )}
               <div className="form-group">
                 <label>Required</label>
                 <input type="number" min="1" value={editingReq?.required_count || 1} onChange={e => setEditingReq(r => ({ ...r, required_count: parseInt(e.target.value) }))} />
@@ -537,6 +927,11 @@ export default function SchedulePage({ onToast }) {
               </div>
             </div>
             <div className="modal-footer">
+              {editingReq?.id && (
+                <button className="btn btn-danger" style={{ marginRight: 'auto' }} onClick={() => { setShowReqModal(false); removeRequirement(editingReq); }}>
+                  <Trash2 size={13} /> Delete
+                </button>
+              )}
               <button className="btn btn-ghost" onClick={() => setShowReqModal(false)}>Cancel</button>
               <button className="btn btn-primary" onClick={saveRequirement}>Save</button>
             </div>
