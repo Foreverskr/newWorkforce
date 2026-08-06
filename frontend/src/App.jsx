@@ -13,7 +13,7 @@ import LeavesPage from "./pages/LeavesPage.jsx";
 import AnalyticsPage from "./pages/AnalyticsPage.jsx";
 import SchedulePage from "./pages/SchedulePage";
 import { ThemeProvider, useTheme } from "./contexts/ThemeContext";
-import { useSessionTimeout } from "./hooks/Usesessiontimeout.js";
+import { useSessionTimeout } from "./hooks/useSessionTimeout.js";
 import {
   getSession,
   getSessionInvalidReason,
