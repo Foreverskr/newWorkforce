@@ -1,6 +1,6 @@
 import { getToken, clearSession } from '../utils/session.js';
 
-const BASE = '/api';
+const BASE = import.meta.env.VITE_API_URL || '/api';
 
 async function request(path, options = {}) {
   const token = getToken();
