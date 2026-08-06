@@ -165,153 +165,177 @@ export async function notifyInactive(req, res) {
 //   - clocked in today (attendance present/late)
 //   - driver_availability === 'available'
 
+// The availability panel uses employees.position as its only driver source.
+// `driver_availability` remains a manual operational/safety override; it is
+// never enough on its own to make an employee available.
+const DRIVER_POSITION = 'Driver';
+const DRIVER_CLOCK_IN_GRACE_MINUTES = Number(process.env.DRIVER_CLOCK_IN_GRACE_MINUTES || 20);
+
+function getManilaNow() {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(new Date());
+  const value = Object.fromEntries(parts.filter(part => part.type !== 'literal').map(part => [part.type, part.value]));
+  return { date: `${value.year}-${value.month}-${value.day}`, minutes: Number(value.hour) * 60 + Number(value.minute) };
+}
+
+function minutesSinceMidnight(time) {
+  if (!time) return null;
+  const [hours, minutes] = time.slice(0, 5).split(':').map(Number);
+  return hours * 60 + minutes;
+}
+
+async function getDriverRoster(date) {
+  const { data: drivers, error: driversError } = await supabase
+    .from('employees').select('*').ilike('position', DRIVER_POSITION).order('name', { ascending: true });
+  if (driversError) throw driversError;
+  if (!drivers.length) return [];
+
+  const ids = drivers.map(driver => driver.id);
+  const [attendanceResult, shiftsResult, leaveResult, coverageResult, overrideResult] = await Promise.all([
+    supabase.from('attendance').select('employee_id, status, clock_in, clock_out').eq('date', date).in('employee_id', ids),
+    supabase.from('shift_assignments').select('employee_id, is_day_off, shift_templates:roles(name, start_time)').eq('date', date).in('employee_id', ids),
+    supabase.from('leaves').select('employee_id').eq('status', 'approved').lte('start_date', date).gte('end_date', date).in('employee_id', ids),
+    supabase.from('employee_reassignments').select('id, original_employee_id, replacement_employee_id, status, invalid_reason, created_at').eq('date', date).order('created_at', { ascending: false }),
+    supabase.from('driver_availability_overrides').select('employee_id, availability, reason, expires_at').eq('date', date).in('employee_id', ids),
+  ]);
+  for (const result of [attendanceResult, shiftsResult, leaveResult, coverageResult, overrideResult]) if (result.error) throw result.error;
+
+  const attendance = Object.fromEntries((attendanceResult.data || []).map(row => [row.employee_id, row]));
+  const shifts = Object.fromEntries((shiftsResult.data || []).map(row => [row.employee_id, row]));
+  const overrides = Object.fromEntries((overrideResult.data || []).filter(row => !row.expires_at || new Date(row.expires_at) > new Date()).map(row => [row.employee_id, row]));
+  const onLeave = new Set((leaveResult.data || []).map(row => row.employee_id));
+  const coverageByOriginal = new Map();
+  const activeCoverage = (coverageResult.data || []).filter(row => row.status === 'active');
+  for (const row of coverageResult.data || []) {
+    if (!coverageByOriginal.has(row.original_employee_id)) coverageByOriginal.set(row.original_employee_id, row);
+  }
+  const covered = new Set(activeCoverage.map(row => row.original_employee_id));
+  const covering = new Set(activeCoverage.map(row => row.replacement_employee_id));
+  const employeesById = Object.fromEntries(drivers.map(driver => [driver.id, driver]));
+  const now = getManilaNow();
+
+  return drivers.map(employee => {
+    const attendanceRecord = attendance[employee.id];
+    const shift = shifts[employee.id];
+    const shiftStart = shift?.shift_templates?.start_time || employee.shift_start;
+    const deadline = minutesSinceMidnight(shiftStart) + DRIVER_CLOCK_IN_GRACE_MINUTES;
+    const missedClockIn = date <= now.date && Boolean(shift && !shift.is_day_off) && !attendanceRecord?.clock_in && now.minutes >= deadline;
+    const clockedInLate = Boolean(attendanceRecord?.clock_in) && date <= now.date && Boolean(shift && !shift.is_day_off) && minutesSinceMidnight(attendanceRecord.clock_in) > deadline;
+    const override = overrides[employee.id];
+    let effectiveAvailability = 'not_available';
+    let availabilityReason = 'Not scheduled';
+
+    if (employee.status !== 'active') availabilityReason = 'Inactive employee';
+    else if (onLeave.has(employee.id)) availabilityReason = 'On approved leave';
+    else if (attendanceRecord?.status === 'absent') availabilityReason = 'Absent';
+    else if (!shift || shift.is_day_off) availabilityReason = 'Not scheduled';
+    else if (override) availabilityReason = override.reason || 'Manual operational override';
+    else if (covering.has(employee.id)) availabilityReason = 'Covering another driver';
+    else if (attendanceRecord?.clock_out) availabilityReason = 'Clocked out';
+    else if (missedClockIn) availabilityReason = `Missed clock-in deadline (${DRIVER_CLOCK_IN_GRACE_MINUTES} minutes)`;
+    else if (clockedInLate) availabilityReason = `Clocked in after the ${DRIVER_CLOCK_IN_GRACE_MINUTES}-minute deadline`;
+    else if (!attendanceRecord?.clock_in) availabilityReason = 'Not clocked in';
+    else { effectiveAvailability = 'available'; availabilityReason = 'Clocked in and unassigned'; }
+
+    const canCoverWithoutCoverage = employee.status === 'active' && Boolean(shift && !shift.is_day_off) && !onLeave.has(employee.id) && attendanceRecord?.status !== 'absent' && !override && Boolean(attendanceRecord?.clock_in) && !attendanceRecord?.clock_out && !clockedInLate;
+    const coverage = coverageByOriginal.get(employee.id);
+    const needsReplacement = effectiveAvailability !== 'available' && Boolean(shift && !shift.is_day_off) && !covered.has(employee.id) && (onLeave.has(employee.id) || attendanceRecord?.status === 'absent' || Boolean(override) || missedClockIn || clockedInLate);
+    return { ...employee, attendance_status: attendanceRecord?.status || 'no_record', clock_in: attendanceRecord?.clock_in || null, shift_name: shift?.shift_templates?.name || null, shift_start: shiftStart || null, effective_availability: effectiveAvailability, availability_reason: availabilityReason, needs_replacement: needsReplacement, can_cover: effectiveAvailability === 'available', can_cover_without_coverage: canCoverWithoutCoverage, coverage_status: coverage?.status || null, coverage_invalid_reason: coverage?.invalid_reason || null, replacement_name: coverage ? employeesById[coverage.replacement_employee_id]?.name || 'Unknown driver' : null };
+  });
+}
+
+// An active coverage record is valid only while its replacement remains able
+// to work. Invalid records stay in history but no longer hide the original
+// driver's need for a replacement.
+export async function revalidateDriverCoverage(date = getManilaNow().date) {
+  const roster = await getDriverRoster(date);
+  const byId = Object.fromEntries(roster.map(driver => [driver.id, driver]));
+  const { data: activeCoverage, error } = await supabase
+    .from('employee_reassignments')
+    .select('id, replacement_employee_id')
+    .eq('date', date)
+    .eq('status', 'active');
+  if (error) throw error;
+
+  const invalidated = [];
+  for (const coverage of activeCoverage || []) {
+    const replacement = byId[coverage.replacement_employee_id];
+    if (replacement?.can_cover_without_coverage) continue;
+    const reason = replacement?.availability_reason || 'Replacement is no longer a Driver role employee';
+    const { data, error: updateError } = await supabase
+      .from('employee_reassignments')
+      .update({ status: 'invalid', invalid_reason: reason, invalidated_at: new Date().toISOString() })
+      .eq('id', coverage.id)
+      .eq('status', 'active')
+      .select('id')
+      .maybeSingle();
+    if (updateError) throw updateError;
+    if (data) invalidated.push({ coverage_id: data.id, reason });
+  }
+  return invalidated;
+}
+
 // GET full fleet-driver roster with today's computed status (for the availability panel)
 export async function getFleetDrivers(req, res) {
-  const date = req.query.date || new Date().toISOString().split('T')[0];
-
-  const { data: fleetDrivers, error: empError } = await supabase
-    .from('employees')
-    .select('*')
-    .eq('is_fleet_driver', true)
-    .order('name', { ascending: true });
-  if (empError) return handleError(res, empError);
-
-  const ids = fleetDrivers.map(e => e.id);
-  const { data: attendance, error: attError } = await supabase
-    .from('attendance')
-    .select('employee_id, status')
-    .eq('date', date)
-    .in('employee_id', ids);
-  if (attError) return handleError(res, attError);
-  const attMap = Object.fromEntries(attendance.map(a => [a.employee_id, a.status]));
-
-  const { data: reassignments } = await supabase
-    .from('employee_reassignments')
-    .select('original_employee_id, replacement_employee_id')
-    .eq('date', date);
-  const coveredIds = new Set((reassignments || []).map(r => r.original_employee_id));
-  const assignedElsewhereIds = new Set((reassignments || []).map(r => r.replacement_employee_id));
-
-  const roster = fleetDrivers.map(e => {
-    const attendanceStatus = attMap[e.id] || 'no_record';
-    const needsReplacement = (attendanceStatus === 'absent' || e.driver_availability === 'unavailable') && !coveredIds.has(e.id);
-    const canCover = e.status === 'active'
-      && e.driver_availability === 'available'
-      && ['present', 'late'].includes(attendanceStatus)
-      && !assignedElsewhereIds.has(e.id);
-
-    // Effective availability for display — clocking in is a prerequisite.
-    // A driver manually flagged 'available' who hasn't clocked in yet is
-    // NOT available; they just haven't checked in for the day.
-    let effectiveAvailability;
-    if (attendanceStatus === 'absent') effectiveAvailability = 'absent';
-    else if (!['present', 'late'].includes(attendanceStatus)) effectiveAvailability = 'not_clocked_in';
-    else if (e.driver_availability === 'unavailable') effectiveAvailability = 'unavailable';
-    else effectiveAvailability = 'available';
-
-    return {
-      ...e,
-      attendance_status: attendanceStatus,
-      effective_availability: effectiveAvailability,
-      needs_replacement: needsReplacement,
-      can_cover: canCover,
-    };
-  });
-
-  res.json(roster);
+  try {
+    const date = req.query.date || getManilaNow().date;
+    await revalidateDriverCoverage(date);
+    return res.json(await getDriverRoster(date));
+  } catch (error) {
+    return handleError(res, error);
+  }
 }
 
 // GET fleet-driver employees who need replacement today (absent OR manually unavailable) and don't yet have coverage
 export async function getAbsentDrivers(req, res) {
-  const date = req.query.date || new Date().toISOString().split('T')[0];
-
-  const { data: fleetDrivers, error: empError } = await supabase
-    .from('employees')
-    .select('*')
-    .eq('is_fleet_driver', true);
-  if (empError) return handleError(res, empError);
-
-  const ids = fleetDrivers.map(e => e.id);
-  const { data: attendance, error: attError } = await supabase
-    .from('attendance')
-    .select('employee_id, status')
-    .eq('date', date)
-    .in('employee_id', ids);
-  if (attError) return handleError(res, attError);
-
-  const attMap = Object.fromEntries(attendance.map(a => [a.employee_id, a.status]));
-
-  const { data: existing } = await supabase
-    .from('employee_reassignments')
-    .select('original_employee_id')
-    .eq('date', date);
-  const coveredIds = new Set((existing || []).map(r => r.original_employee_id));
-
-  const needsReplacement = fleetDrivers.filter(e =>
-    (attMap[e.id] === 'absent' || e.driver_availability === 'unavailable') && !coveredIds.has(e.id)
-  );
-  res.json(needsReplacement);
+  try {
+    const date = req.query.date || getManilaNow().date;
+    await revalidateDriverCoverage(date);
+    const roster = await getDriverRoster(date);
+    return res.json(roster.filter(driver => driver.needs_replacement));
+  } catch (error) {
+    return handleError(res, error);
+  }
 }
 
 // GET fleet-driver employees available to cover a shift on a given date
 // (clocked in — present/late — manually marked available, and not already assigned elsewhere that day)
 export async function getAvailableDrivers(req, res) {
-  const date = req.query.date || new Date().toISOString().split('T')[0];
-  const excludeId = req.query.exclude_employee_id || null;
-
-  const { data: fleetDrivers, error: empError } = await supabase
-    .from('employees')
-    .select('*')
-    .eq('is_fleet_driver', true)
-    .eq('status', 'active')
-    .eq('driver_availability', 'available');
-  if (empError) return handleError(res, empError);
-
-  const ids = fleetDrivers.map(e => e.id);
-  const { data: attendance, error: attError } = await supabase
-    .from('attendance')
-    .select('employee_id, status')
-    .eq('date', date)
-    .in('employee_id', ids);
-  if (attError) return handleError(res, attError);
-
-  const attMap = Object.fromEntries(attendance.map(a => [a.employee_id, a.status]));
-
-  const { data: existing } = await supabase
-    .from('employee_reassignments')
-    .select('replacement_employee_id')
-    .eq('date', date);
-  const alreadyAssigned = new Set((existing || []).map(r => r.replacement_employee_id));
-
-  const available = fleetDrivers.filter(e => {
-    if (excludeId && e.id === excludeId) return false;
-    if (alreadyAssigned.has(e.id)) return false;
-    const status = attMap[e.id];
-    return status === 'present' || status === 'late';
-  });
-
-  res.json(available);
+  try {
+    const date = req.query.date || getManilaNow().date;
+    await revalidateDriverCoverage(date);
+    const roster = await getDriverRoster(date);
+    return res.json(roster.filter(driver => driver.can_cover && driver.id !== req.query.exclude_employee_id));
+  } catch (error) {
+    return handleError(res, error);
+  }
 }
 
 // PATCH manually set a fleet driver's availability (independent of attendance)
 export async function setDriverAvailability(req, res) {
-  const { availability, reason } = req.body;
+  const { availability, reason, date = getManilaNow().date, expires_at = null } = req.body;
   if (!['available', 'unavailable'].includes(availability)) {
     return res.status(400).json({ error: "availability must be 'available' or 'unavailable'" });
   }
 
   const { data: employee, error: empError } = await supabase
     .from('employees')
-    .select('id, is_fleet_driver')
+    .select('id, position')
     .eq('id', req.params.id)
     .single();
   if (empError || !employee) return res.status(404).json({ error: 'Employee not found' });
-  if (!employee.is_fleet_driver) return res.status(400).json({ error: 'Employee is not flagged as a fleet driver' });
+  if (employee.position?.toLowerCase() !== DRIVER_POSITION.toLowerCase()) return res.status(400).json({ error: 'Employee position must be Driver' });
+
+  if (availability === 'available') {
+    const { error } = await supabase.from('driver_availability_overrides').delete()
+      .eq('employee_id', req.params.id).eq('date', date);
+    if (error) return handleError(res, error);
+    return res.json({ employee_id: req.params.id, date, availability: 'available' });
+  }
+  if (!reason?.trim()) return res.status(400).json({ error: 'reason is required when marking a driver unavailable' });
 
   const { data, error } = await supabase
-    .from('employees')
-    .update({ driver_availability: availability, updated_at: new Date().toISOString() })
-    .eq('id', req.params.id)
+    .from('driver_availability_overrides')
+    .upsert([{ employee_id: req.params.id, date, availability, reason: reason.trim(), expires_at }], { onConflict: 'employee_id,date' })
     .select()
     .single();
   if (error) return handleError(res, error);
@@ -319,7 +343,7 @@ export async function setDriverAvailability(req, res) {
   // Optional audit trail alongside the manual toggle — reuses the reassignments
   // log's `reason` field pattern; only recorded when marking unavailable with a note.
   if (availability === 'unavailable' && reason) {
-    console.log(`Driver ${data.name} marked unavailable: ${reason}`);
+    console.log(`Driver ${employee.id} marked unavailable for ${date}: ${reason}`);
   }
 
   res.json(data);
@@ -349,44 +373,58 @@ export async function reassignDriver(req, res) {
     return res.status(400).json({ error: 'Replacement must be a different employee' });
   }
 
+  let roster;
+  try {
+    roster = await getDriverRoster(date);
+  } catch (error) {
+    return handleError(res, error);
+  }
+  const originalState = roster.find(driver => driver.id === original_employee_id);
+  const replacementState = roster.find(driver => driver.id === replacement_employee_id);
+  if (!originalState) return res.status(404).json({ error: 'Original employee is not an active Driver role record' });
+  // Manual override: a manager can assign coverage for ANY driver (not scheduled,
+  // already available, before the clock-in deadline, etc.) — not just ones the
+  // system's automatic rules flagged with needs_replacement. The replacement
+  // driver must still be genuinely eligible to work, though.
+  if (!replacementState?.can_cover) {
+    return res.status(400).json({ error: `Replacement driver is not eligible: ${replacementState?.availability_reason || 'not a Driver role record'}` });
+  }
+
   const { data: original, error: origError } = await supabase
     .from('employees')
     .select('*')
     .eq('id', original_employee_id)
-    .eq('is_fleet_driver', true)
+    .ilike('position', DRIVER_POSITION)
     .single();
   if (origError || !original) return res.status(404).json({ error: 'Fleet driver not found' });
-
-  const { data: origAttendance } = await supabase
-    .from('attendance')
-    .select('status')
-    .eq('employee_id', original_employee_id)
-    .eq('date', date)
-    .maybeSingle();
-  const originalNeedsReplacement = origAttendance?.status === 'absent' || original.driver_availability === 'unavailable';
-  if (!originalNeedsReplacement) {
-    return res.status(400).json({ error: 'This driver is not marked absent or unavailable on this date' });
-  }
 
   const { data: replacement, error: replError } = await supabase
     .from('employees')
     .select('*')
     .eq('id', replacement_employee_id)
-    .eq('is_fleet_driver', true)
+    .ilike('position', DRIVER_POSITION)
     .eq('status', 'active')
-    .eq('driver_availability', 'available')
     .single();
   if (replError || !replacement) return res.status(404).json({ error: 'Replacement must be an active fleet driver currently marked available' });
 
   const { data: replAttendance } = await supabase
     .from('attendance')
-    .select('status')
+    .select('status, clock_in')
     .eq('employee_id', replacement_employee_id)
     .eq('date', date)
     .maybeSingle();
-  if (!['present', 'late'].includes(replAttendance?.status)) {
+  if (!replAttendance?.clock_in) {
     return res.status(400).json({ error: 'Replacement driver is not clocked in on this date' });
   }
+
+  const { data: existingCoverage } = await supabase
+    .from('employee_reassignments')
+    .select('id')
+    .eq('date', date)
+    .eq('original_employee_id', original_employee_id)
+    .eq('status', 'active')
+    .maybeSingle();
+  if (existingCoverage) return res.status(409).json({ error: 'This driver already has replacement coverage' });
 
   const { data, error } = await supabase
     .from('employee_reassignments')
@@ -398,7 +436,6 @@ export async function reassignDriver(req, res) {
   res.status(201).json(data);
 }
 
-// DELETE / undo a reassignment
 export async function deleteReassignment(req, res) {
   const { error } = await supabase.from('employee_reassignments').delete().eq('id', req.params.id);
   if (error) return handleError(res, error);

@@ -140,7 +140,9 @@ export async function createAssignment(req, res) {
   const dayOff = !!is_day_off;
 
   // 🟢 HARDENED VALIDATION: Block empty strings and "undefined"
-  if (!employee_id || employee_id === 'undefined' || employee_id === 'null' || employee_id.trim() === '') {
+  // String(employee_id) avoids a TypeError if a client ever sends a non-string
+  // (e.g. a number) — .trim() alone would throw before we get to respond 400.
+  if (!employee_id || employee_id === 'undefined' || employee_id === 'null' || String(employee_id).trim() === '') {
     return res.status(400).json({ error: 'A valid employee_id is required.' });
   }
 
