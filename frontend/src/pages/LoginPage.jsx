@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { LogIn } from 'lucide-react';
 import { saveSession } from '../utils/session.js';
 
-const API = 'http://localhost:3001';
+const API = import.meta.env.VITE_API_URL || 'http://localhost:3001';
 
 export default function LoginPage({ onLogin }) {
   const [form, setForm] = useState({ username: '', password: '' });
