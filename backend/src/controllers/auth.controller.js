@@ -1,11 +1,20 @@
 import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
 import { supabase } from '../config/supabase.js';
+
+const JWT_SECRET = process.env.JWT_SECRET;
+const TOKEN_EXPIRY = '8h'; // testing only! // <- backend's source of truth for session length
 
 export async function login(req, res) {
   const { username, password } = req.body;
 
   if (!username || !password) {
     return res.status(400).json({ error: 'Username and password are required' });
+  }
+
+  if (!JWT_SECRET) {
+    console.error('JWT_SECRET is not set in environment variables');
+    return res.status(500).json({ error: 'Server misconfiguration' });
   }
 
   // 1. Find admin by username
@@ -25,10 +34,24 @@ export async function login(req, res) {
     return res.status(401).json({ error: 'Invalid username or password' });
   }
 
-  // 3. Return success (store a simple token in frontend)
+  // 3. Issue a signed token. The 8hr expiry lives INSIDE the token, so the
+  // server itself will reject it after 8 hours — not just the frontend UI.
+  const token = jwt.sign(
+    { id: admin.id, username: admin.username },
+    JWT_SECRET,
+    { expiresIn: TOKEN_EXPIRY }
+  );
+
   res.json({
     success: true,
-    admin: { id: admin.id, username: admin.username },
+    token,
+    admin: {
+      id: admin.id,
+      username: admin.username,
+      name: admin.name || admin.full_name || admin.username,
+      role: admin.role || admin.position || 'Admin',
+      status: admin.status || (admin.is_active === false ? 'inactive' : 'active'),
+    },
   });
 }
 

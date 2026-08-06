@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import {
   getAll, getOne, create, update, remove,
-  getInactivityLogs, checkInactivity,
+  getInactivityLogs, checkInactivity, notifyInactive,
   getFleetDrivers, getAbsentDrivers, getAvailableDrivers, setDriverAvailability,
   getReassignments, reassignDriver, deleteReassignment,
 } from '../controllers/employees.controller.js';
@@ -17,6 +17,7 @@ router.get('/fleet-drivers', getFleetDrivers);
 router.get('/absent-drivers', getAbsentDrivers);
 router.get('/available-drivers', getAvailableDrivers);
 router.patch('/:id/driver-availability', setDriverAvailability);
+router.post('/:id/notify-inactive', notifyInactive);
 
 router.get('/reassignments', getReassignments);
 router.post('/reassign-driver', reassignDriver);

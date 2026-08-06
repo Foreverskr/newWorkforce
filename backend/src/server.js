@@ -1,9 +1,13 @@
+import 'dotenv/config';
+
 import express from 'express';
 import cors from 'cors';
-import dotenv from 'dotenv';
 
 import { notFoundHandler, errorHandler } from './middleware/errorHandler.js';
+import { requireAuth } from './middleware/authMiddleware.js';
 
+import positionsRoutes from './routes/positions.routes.js';
+import staffingRequirementsRoutes from './routes/staffingRequirements.routes.js';
 import authRoutes from './routes/auth.routes.js';
 import employeesRoutes from './routes/employees.routes.js';
 import leavesRoutes from './routes/leaves.routes.js';
@@ -12,8 +16,8 @@ import scheduleRoutes, { templateRouter } from './routes/schedule.routes.js';
 import driversRoutes from './routes/drivers.routes.js';
 import healthRoutes from './routes/health.routes.js';
 import analyticsRoutes from './routes/analytics.routes.js';
-
-dotenv.config();
+import fingerprintsRoutes from './routes/fingerprints.routes.js';
+import deviceRoutes from './routes/device.routes.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -21,15 +25,26 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
+// Public routes — no token required
 app.use('/api/auth', authRoutes);
-app.use('/api/employees', employeesRoutes);
-app.use('/api/leaves', leavesRoutes);
-app.use('/api/attendance', attendanceRoutes);
-app.use('/api/shift-templates', templateRouter);
-app.use('/api/schedule', scheduleRoutes);
-app.use('/api/drivers', driversRoutes);
-app.use('/api/analytics', analyticsRoutes);
 app.use('/api/health', healthRoutes);
+
+// Device routes — auth'd via a shared device key (see middleware/deviceAuth.js),
+// NOT a user JWT, since the ESP32 never logs in as an admin/employee.
+app.use('/api/device', deviceRoutes);
+
+// Everything below requires a valid, non-expired token
+app.use('/api/employees', requireAuth, employeesRoutes);
+app.use('/api/employees/:employeeId/fingerprints', requireAuth, fingerprintsRoutes);
+app.use('/api/leaves', requireAuth, leavesRoutes);
+app.use('/api/attendance', requireAuth, attendanceRoutes);
+app.use('/api/shift-templates', requireAuth, templateRouter);
+app.use('/api/schedule', requireAuth, scheduleRoutes);
+app.use('/api/drivers', requireAuth, driversRoutes);
+app.use('/api/analytics', requireAuth, analyticsRoutes);
+app.use('/api/positions', requireAuth, positionsRoutes); // <-- Added requireAuth
+app.use('/api/staffing-requirements', requireAuth, staffingRequirementsRoutes); // <-- I also added 
+
 
 app.use(notFoundHandler);
 app.use(errorHandler);

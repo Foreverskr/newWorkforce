@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Truck, RefreshCw, AlertTriangle, CheckCircle2, Clock } from 'lucide-react';
+import { api } from '../lib/api';
 
 const STATUS_META = {
   active:   { label: 'Active',   bg: 'var(--green-bg)', color: 'var(--green)' },
@@ -18,22 +19,25 @@ export default function DriversPage({ onToast }) {
     setLoading(true);
     try {
       const [driversData, logsData] = await Promise.all([
-        fetch('/api/drivers').then(r => r.json()),
-        fetch('/api/drivers/inactivity-logs').then(r => r.json()),
+        api.getDrivers(),
+        api.getInactivityLogs(),
       ]);
-      setDrivers(driversData);
-      setLogs(logsData);
+      // Ensure we have arrays, handle nested responses
+      setDrivers(Array.isArray(driversData) ? driversData : driversData?.drivers || []);
+      setLogs(Array.isArray(logsData) ? logsData : logsData?.logs || []);
     } catch (e) {
       onToast('Failed to load drivers', 'error');
+      setDrivers([]);
+      setLogs([]);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [onToast]);
 
   const runCheck = useCallback(async (silent = false) => {
     setChecking(true);
     try {
-      const res = await fetch('/api/drivers/check-inactivity', { method: 'POST' }).then(r => r.json());
+      const res = await api.checkDriverInactivity();
       setLastCheck(new Date());
       if (res.newly_flagged > 0) {
         onToast(`${res.newly_flagged} driver(s) flagged inactive — HR1 notified`, 'error');
@@ -46,12 +50,12 @@ export default function DriversPage({ onToast }) {
     } finally {
       setChecking(false);
     }
-  }, [load]);
+  }, [load, onToast]);
 
   // Auto-check on page load, then load data
   useEffect(() => {
     runCheck(true);
-  }, []);
+  }, [runCheck]);
 
   const activeCount   = drivers.filter(d => d.status === 'active').length;
   const inactiveCount = drivers.filter(d => d.status === 'inactive').length;

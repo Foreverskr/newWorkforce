@@ -4,6 +4,18 @@ import { api } from '../lib/api';
 import { format } from 'date-fns';
 import * as XLSX from 'xlsx';
 
+const PAGE_SIZES = [10, 25, 50, 100];
+
+// Builds a local YYYY-MM-DD string without going through UTC (toISOString()
+// converts to UTC first, which shows yesterday's date for users east of UTC
+// during their early-morning hours).
+function toISODate(d) {
+  const yr = d.getFullYear();
+  const mo = String(d.getMonth() + 1).padStart(2, '0');
+  const da = String(d.getDate()).padStart(2, '0');
+  return `${yr}-${mo}-${da}`;
+}
+
 // Handles Excel/Sheets date cells. Sheets store dates as plain serial numbers
 // with no timezone attached, so we parse that number directly (pure arithmetic,
 // no JS Date involved) — the only reliable way to avoid off-by-one shifts for
@@ -50,7 +62,7 @@ function normalizeImportTime(value) {
 
 function ManualModal({ employees, onClose, onSave }) {
   const [form, setForm] = useState({
-    employee_id: '', date: new Date().toISOString().split('T')[0],
+    employee_id: '', date: toISODate(new Date()),
     clock_in: '09:00', clock_out: '', status: 'present', notes: '',
   });
   const [saving, setSaving] = useState(false);
@@ -122,13 +134,15 @@ export default function AttendancePage({ onToast }) {
   const [employees, setEmployees] = useState([]);
   const [loading, setLoading] = useState(true);
   const [filters, setFilters] = useState({
-    start_date: new Date().toISOString().split('T')[0],
-    end_date: new Date().toISOString().split('T')[0],
-    status: '', employee_id: '',
+    start_date: toISODate(new Date()),
+    end_date: toISODate(new Date()),
+    status: '',
   });
   const [search, setSearch] = useState('');
   const [showModal, setShowModal] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [rowsPerPage, setRowsPerPage] = useState(10);
+  const [currentPage, setCurrentPage] = useState(1);
   const fileInputRef = useRef(null);
 
   useEffect(() => { api.getEmployees().then(setEmployees); }, []);
@@ -140,7 +154,6 @@ export default function AttendancePage({ onToast }) {
       if (filters.start_date) params.start_date = filters.start_date;
       if (filters.end_date) params.end_date = filters.end_date;
       if (filters.status) params.status = filters.status;
-      if (filters.employee_id) params.employee_id = filters.employee_id;
       setRecords(await api.getAttendance(params));
     } catch(e) { onToast(e.message, 'error'); }
     finally { setLoading(false); }
@@ -162,6 +175,22 @@ export default function AttendancePage({ onToast }) {
     const q = search.toLowerCase();
     return r.employees?.name?.toLowerCase().includes(q) || r.employees?.department?.toLowerCase().includes(q);
   });
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [search, filters.start_date, filters.end_date, filters.status, rowsPerPage]);
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / rowsPerPage));
+
+  useEffect(() => {
+    if (currentPage > totalPages) setCurrentPage(totalPages);
+  }, [currentPage, totalPages]);
+
+  const pageStart = (currentPage - 1) * rowsPerPage;
+  const pageEnd = pageStart + rowsPerPage;
+  const visibleRecords = filtered.slice(pageStart, pageEnd);
+  const showingStart = filtered.length ? pageStart + 1 : 0;
+  const showingEnd = Math.min(pageEnd, filtered.length);
 
   const setF = k => e => setFilters(f => ({ ...f, [k]: e.target.value }));
 
@@ -297,13 +326,6 @@ export default function AttendancePage({ onToast }) {
               <option value="absent">Absent</option>
             </select>
           </div>
-          <div className="form-group" style={{ margin: 0 }}>
-            <label style={{ marginBottom: 4 }}>Employee</label>
-            <select value={filters.employee_id} onChange={setF('employee_id')} style={{ width: 180 }}>
-              <option value="">All employees</option>
-              {employees.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
-            </select>
-          </div>
         </div>
       </div>
 
@@ -313,7 +335,26 @@ export default function AttendancePage({ onToast }) {
         ) : filtered.length === 0 ? (
           <div className="empty-state"><Calendar size={36} /><p>No records found for the selected filters</p></div>
         ) : (
-          <div className="table-wrap">
+          <>
+            <div className="table-toolbar">
+              <div className="rows-control">
+                <span>Show</span>
+                <select
+                  value={rowsPerPage}
+                  onChange={e => setRowsPerPage(Number(e.target.value))}
+                >
+                  {PAGE_SIZES.map(size => (
+                    <option key={size} value={size}>{size}</option>
+                  ))}
+                </select>
+                <span>entries</span>
+              </div>
+              <div className="pagination-summary">
+                Showing {showingStart}-{showingEnd} of {filtered.length}
+              </div>
+            </div>
+
+            <div className="table-wrap">
             <table>
               <thead>
                 <tr>
@@ -329,7 +370,7 @@ export default function AttendancePage({ onToast }) {
                 </tr>
               </thead>
               <tbody>
-                {filtered.map(r => (
+                {visibleRecords.map(r => (
                   <tr key={r.id}>
                     <td>
                       <div className="flex-center">
@@ -339,7 +380,7 @@ export default function AttendancePage({ onToast }) {
                         {r.employees?.name || '—'}
                       </div>
                     </td>
-                    <td>{r.employees?.department || '—'}</td>
+                    <td>{r.employees?.department ? r.employees.department : '⚠️ MISSING'}</td>
                     <td className="mono">{r.date}</td>
                     <td className="mono" style={{ color: 'var(--green)' }}>{r.clock_in || '—'}</td>
                     <td className="mono" style={{ color: 'var(--accent)' }}>{r.clock_out || '—'}</td>
@@ -358,8 +399,27 @@ export default function AttendancePage({ onToast }) {
                   </tr>
                 ))}
               </tbody>
-            </table>
-          </div>
+              </table>
+            </div>
+
+            <div className="pagination-bar">
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() => setCurrentPage(page => Math.max(1, page - 1))}
+                disabled={currentPage === 1}
+              >
+                Previous
+              </button>
+              <span className="pagination-page">Page {currentPage} of {totalPages}</span>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() => setCurrentPage(page => Math.min(totalPages, page + 1))}
+                disabled={currentPage === totalPages}
+              >
+                Next
+              </button>
+            </div>
+          </>
         )}
       </div>
 

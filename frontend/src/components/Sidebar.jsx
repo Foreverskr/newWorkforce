@@ -9,7 +9,7 @@ const navItems = [
   { to: '/',           label: 'Dashboard',        icon: LayoutDashboard },
   { to: '/clock',      label: 'Clock In / Out',   icon: Clock           },
   { to: '/attendance', label: 'Timesheet Management',        icon: Calendar        },
-  { to: '/employees',  label: 'Employee Management',         icon: Users           },
+  { to: '/employees',  label: 'Status & Biometrics Management',         icon: Users           },
   { to: '/schedule',  label: 'Shift & Schedule Management',         icon: Calendar           },
   { to: '/leaves',     label: 'Leave Management',  icon: FileText        },
   { to: '/drivers',    label: 'Drivers',           icon: Users           },

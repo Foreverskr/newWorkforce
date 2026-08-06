@@ -10,6 +10,8 @@ const TYPE_COLORS = {
   unpaid:    { bg: 'rgba(148,163,184,0.15)', color: 'var(--text-muted)' },
 };
 
+const PAGE_SIZES = [10, 25, 50, 100];
+
 function LeaveModal({ employees, onClose, onSave }) {
   const [form, setForm] = useState({
     employee_id: '',
@@ -170,6 +172,8 @@ export default function LeavePage({ onToast }) {
   const [filters, setFilters]     = useState({ status: '', type: '' });
   const [showAdd, setShowAdd]     = useState(false);
   const [reviewing, setReviewing] = useState(null);
+  const [rowsPerPage, setRowsPerPage] = useState(10);
+  const [currentPage, setCurrentPage] = useState(1);
 
   useEffect(() => {
     api.getEmployees().then(d => setEmployees(d.filter(e => e.status === 'active')));
@@ -219,6 +223,22 @@ export default function LeavePage({ onToast }) {
     return l.employees?.name?.toLowerCase().includes(q) ||
            l.employees?.department?.toLowerCase().includes(q);
   });
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [search, filters.status, filters.type, rowsPerPage]);
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / rowsPerPage));
+
+  useEffect(() => {
+    if (currentPage > totalPages) setCurrentPage(totalPages);
+  }, [currentPage, totalPages]);
+
+  const pageStart = (currentPage - 1) * rowsPerPage;
+  const pageEnd = pageStart + rowsPerPage;
+  const visibleLeaves = filtered.slice(pageStart, pageEnd);
+  const showingStart = filtered.length ? pageStart + 1 : 0;
+  const showingEnd = Math.min(pageEnd, filtered.length);
 
   // Summary counts
   const pending  = leaves.filter(l => l.status === 'pending').length;
@@ -301,7 +321,26 @@ export default function LeavePage({ onToast }) {
             <p>No leave requests found</p>
           </div>
         ) : (
-          <div className="table-wrap">
+          <>
+            <div className="table-toolbar">
+              <div className="rows-control">
+                <span>Show</span>
+                <select
+                  value={rowsPerPage}
+                  onChange={e => setRowsPerPage(Number(e.target.value))}
+                >
+                  {PAGE_SIZES.map(size => (
+                    <option key={size} value={size}>{size}</option>
+                  ))}
+                </select>
+                <span>entries</span>
+              </div>
+              <div className="pagination-summary">
+                Showing {showingStart}-{showingEnd} of {filtered.length}
+              </div>
+            </div>
+
+            <div className="table-wrap">
             <table>
               <thead>
                 <tr>
@@ -317,7 +356,7 @@ export default function LeavePage({ onToast }) {
                 </tr>
               </thead>
               <tbody>
-                {filtered.map(l => {
+                {visibleLeaves.map(l => {
                   const typeStyle = TYPE_COLORS[l.type] || TYPE_COLORS.unpaid;
                   return (
                     <tr key={l.id}>
@@ -374,7 +413,26 @@ export default function LeavePage({ onToast }) {
                 })}
               </tbody>
             </table>
-          </div>
+            </div>
+
+            <div className="pagination-bar">
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() => setCurrentPage(page => Math.max(1, page - 1))}
+                disabled={currentPage === 1}
+              >
+                Previous
+              </button>
+              <span className="pagination-page">Page {currentPage} of {totalPages}</span>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() => setCurrentPage(page => Math.min(totalPages, page + 1))}
+                disabled={currentPage === totalPages}
+              >
+                Next
+              </button>
+            </div>
+          </>
         )}
       </div>
 

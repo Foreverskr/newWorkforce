@@ -118,7 +118,7 @@ export async function updateStatus(req, res) {
       // for that specific date only; other dates are untouched.
       const scheduleRecords = workingDays.map(date => ({
         employee_id:      leave.employee_id,
-        shift_template_id: null,
+        role_id: null,          // 🟢 FIXED: changed from shift_template_id to role_id
         date,
         notes:             `On approved ${leave.type} leave`,
         is_day_off:        true,

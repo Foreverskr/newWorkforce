@@ -1,12 +1,16 @@
 import { supabase } from '../config/supabase.js';
 import { handleError } from '../middleware/errorHandler.js';
 
+export function todayDateString(timeZone = 'Asia/Manila') {
+  return new Intl.DateTimeFormat('en-CA', { timeZone }).format(new Date());
+}
+
 export async function getAll(req, res) {
   const { employee_id, date, start_date, end_date, status } = req.query;
 
   let query = supabase
     .from('attendance')
-    .select('*, employees(name, employee_id, department, position, shift_start, shift_end)')
+    .select('*')
     .order('date', { ascending: false })
     .order('clock_in', { ascending: false });
 
@@ -18,7 +22,26 @@ export async function getAll(req, res) {
 
   const { data, error } = await query;
   if (error) return handleError(res, error);
-  res.json(data);
+
+  // Batch-fetch employees in one query instead of one query per row
+  // NOTE: attendance.employee_id actually stores employees.id (uuid), NOT employees.employee_id (text code)
+  const empIds = [...new Set(data.map(r => r.employee_id).filter(Boolean))];
+  let empMap = {};
+  if (empIds.length > 0) {
+    const { data: employees, error: empError } = await supabase
+      .from('employees')
+      .select('id, employee_id, name, department, position, shift_start, shift_end')
+      .in('id', empIds);
+    if (empError) return handleError(res, empError); // don't swallow this — RLS / permission errors were being hidden here
+    empMap = Object.fromEntries((employees || []).map(e => [e.id, e]));
+  }
+
+  const result = data.map(record => ({
+    ...record,
+    employees: empMap[record.employee_id] || null
+  }));
+
+  res.json(result);
 }
 
 export async function getToday(req, res) {
@@ -26,20 +49,36 @@ export async function getToday(req, res) {
 
   const { data: attendanceData, error: attendanceError } = await supabase
     .from('attendance')
-    .select('*, employees(name, employee_id, department, shift_start, shift_end)')
+    .select('*')
     .eq('date', today);
-
   if (attendanceError) return handleError(res, attendanceError);
 
   const { data: totalEmployees, error: empError } = await supabase
     .from('employees')
     .select('id', { count: 'exact' })
     .eq('status', 'active');
-
   if (empError) return handleError(res, empError);
 
-  const present = attendanceData.filter(r => r.status === 'present').length;
-  const late = attendanceData.filter(r => r.status === 'late').length;
+  // Batch-fetch employees in one query instead of one query per row
+  // NOTE: attendance.employee_id actually stores employees.id (uuid), NOT employees.employee_id (text code)
+  const empIds = [...new Set(attendanceData.map(r => r.employee_id).filter(Boolean))];
+  let empMap = {};
+  if (empIds.length > 0) {
+    const { data: employees, error: empLookupError } = await supabase
+      .from('employees')
+      .select('id, employee_id, name, department, shift_start, shift_end')
+      .in('id', empIds);
+    if (empLookupError) return handleError(res, empLookupError); // surfaces RLS / permission issues instead of hiding them
+    empMap = Object.fromEntries((employees || []).map(e => [e.id, e]));
+  }
+
+  const records = attendanceData.map(record => ({
+    ...record,
+    employees: empMap[record.employee_id] || null
+  }));
+
+  const present = records.filter(r => r.status === 'present').length;
+  const late = records.filter(r => r.status === 'late').length;
   const absent = (totalEmployees?.length || 0) - present - late;
 
   res.json({
@@ -48,7 +87,7 @@ export async function getToday(req, res) {
     present,
     late,
     absent: absent < 0 ? 0 : absent,
-    records: attendanceData,
+    records,
   });
 }
 
@@ -69,27 +108,20 @@ export async function clockIn(req, res) {
     .lte('start_date', today)
     .gte('end_date', today)
     .maybeSingle();
-
   if (activeLeave) {
     return res.status(403).json({
       error: `Employee is on approved ${activeLeave.type} leave today (${activeLeave.start_date} → ${activeLeave.end_date})`,
     });
   }
 
-  // Block clock-in if the employee has no shift scheduled for today.
-  // No row at all = admin hasn't rostered them for this date. A row with
-  // is_day_off true = explicitly given the day off. Either way, only an
-  // admin-assigned working shift (shift_template_id set, is_day_off false)
-  // permits a clock-in — mirrors the roster semantics used across
-  // getWorkingDaysInRange and the schedule routes.
+  // Check if they are scheduled
   const { data: todaysShift } = await supabase
     .from('shift_assignments')
-    .select('id, is_day_off, shift_template_id')
+    .select('id, is_day_off, role_id')
     .eq('employee_id', employee_id)
     .eq('date', today)
     .maybeSingle();
-
-  if (!todaysShift || todaysShift.is_day_off || !todaysShift.shift_template_id) {
+  if (!todaysShift || todaysShift.is_day_off || !todaysShift.role_id) {
     return res.status(403).json({
       error: 'No shift scheduled for today — contact your admin to get scheduled before clocking in.',
     });
@@ -101,8 +133,7 @@ export async function clockIn(req, res) {
     .select('id, clock_in, clock_out')
     .eq('employee_id', employee_id)
     .eq('date', today)
-    .single();
-
+    .maybeSingle();
   if (existing?.clock_in) {
     return res.status(409).json({ error: 'Already clocked in today', record: existing });
   }
@@ -128,11 +159,18 @@ export async function clockIn(req, res) {
       [{ employee_id, date: today, clock_in: clockInTime, clock_out: null, hours_worked: null, status, notes: null }],
       { onConflict: 'employee_id,date' }
     )
-    .select('*, employees(name, employee_id, department)')
+    .select()
+    .single();
+  if (error) return handleError(res, error);
+
+  // ⚡ MANUAL EMPLOYEE FETCH
+  const { data: empData } = await supabase
+    .from('employees')
+    .select('name, employee_id, department')
+    .eq('id', employee_id)
     .single();
 
-  if (error) return handleError(res, error);
-  res.status(201).json(data);
+  res.status(201).json({ ...data, employees: empData || null });
 }
 
 export async function clockOut(req, res) {
@@ -190,16 +228,23 @@ export async function clockOut(req, res) {
       updated_at:       new Date().toISOString(),
     })
     .eq('id', record.id)
-    .select('*, employees(name, employee_id, department)')
+    .select()
     .single();
 
   if (error) return handleError(res, error);
-  res.json(data);
+
+  // Fetch employee name manually
+  const { data: empData } = await supabase
+    .from('employees')
+    .select('name, employee_id, department')
+    .eq('id', employee_id)
+    .single();
+
+  res.json({ ...data, employees: empData || null });
 }
 
 // ─── BREAKS ──────────────────────────────────────────────────────────────────
 
-// POST — called by break room RFID scanner on entry
 export async function breakStart(req, res) {
   const { employee_id } = req.body;
   if (!employee_id) return res.status(400).json({ error: 'employee_id is required' });
@@ -217,12 +262,9 @@ export async function breakStart(req, res) {
   if (!record?.clock_in)  return res.status(404).json({ error: 'Employee has not clocked in today' });
   if (record.clock_out)   return res.status(409).json({ error: 'Employee has already clocked out' });
 
-  // Already on a break?
   if (record.lunch_start  && !record.lunch_end)  return res.status(409).json({ error: 'Already on lunch break' });
   if (record.coffee_start && !record.coffee_end) return res.status(409).json({ error: 'Already on coffee break' });
 
-  // Decide which break to assign:
-  // lunch first if not yet taken, then coffee, else no breaks left
   let breakType = null;
   let updatePayload = {};
 
@@ -240,14 +282,20 @@ export async function breakStart(req, res) {
     .from('attendance')
     .update({ ...updatePayload, updated_at: new Date().toISOString() })
     .eq('id', record.id)
-    .select('*, employees(name, employee_id, department)')
+    .select()
     .single();
 
   if (error) return handleError(res, error);
-  res.json({ breakType, record: data });
+  
+  const { data: empData } = await supabase
+    .from('employees')
+    .select('name, employee_id, department')
+    .eq('id', employee_id)
+    .single();
+
+  res.json({ breakType, record: { ...data, employees: empData || null } });
 }
 
-// POST — called by break room RFID scanner on exit
 export async function breakEnd(req, res) {
   const { employee_id } = req.body;
   if (!employee_id) return res.status(400).json({ error: 'employee_id is required' });
@@ -282,11 +330,18 @@ export async function breakEnd(req, res) {
     .from('attendance')
     .update({ ...updatePayload, updated_at: new Date().toISOString() })
     .eq('id', record.id)
-    .select('*, employees(name, employee_id, department)')
+    .select()
     .single();
 
   if (error) return handleError(res, error);
-  res.json({ breakType, record: data });
+
+  const { data: empData } = await supabase
+    .from('employees')
+    .select('name, employee_id, department')
+    .eq('id', employee_id)
+    .single();
+
+  res.json({ breakType, record: { ...data, employees: empData || null } });
 }
 
 // POST manual attendance (admin)
@@ -304,17 +359,21 @@ export async function create(req, res) {
   const { data, error } = await supabase
     .from('attendance')
     .upsert([{ employee_id, date, clock_in, clock_out, status: status || 'present', notes, hours_worked: hoursWorked }], { onConflict: 'employee_id,date' })
-    .select('*, employees(name, employee_id, department)')
+    .select()
     .single();
 
   if (error) return handleError(res, error);
-  res.status(201).json(data);
+
+  const { data: empData } = await supabase
+    .from('employees')
+    .select('name, employee_id, department')
+    .eq('id', employee_id)
+    .single();
+
+  res.status(201).json({ ...data, employees: empData || null });
 }
 
-// POST bulk import (from Excel/Google Sheets upload, parsed client-side)
-// Expects: { records: [{ employee_id, date, clock_in, clock_out, status, notes }, ...] }
-// employee_id here must already be resolved to the internal employees.id UUID —
-// resolution from a human-readable code/name happens in the frontend before this is called.
+// POST bulk import
 export async function bulkImport(req, res) {
   const { records } = req.body;
 
@@ -348,14 +407,233 @@ export async function bulkImport(req, res) {
   const { data, error } = await supabase
     .from('attendance')
     .upsert(rows, { onConflict: 'employee_id,date' })
-    .select('*, employees(name, employee_id, department)');
+    .select();
 
   if (error) return handleError(res, error);
-  res.status(201).json({ imported: data.length, records: data });
+
+  // Fetch employee names for the bulk list
+  // NOTE: attendance.employee_id actually stores employees.id (uuid), NOT employees.employee_id (text code)
+  const empIds = [...new Set(data.map(a => a.employee_id).filter(Boolean))];
+  let empMap = {};
+  if (empIds.length > 0) {
+    const { data: employees, error: empLookupError } = await supabase
+      .from('employees')
+      .select('id, employee_id, name, department')
+      .in('id', empIds);
+    if (empLookupError) return handleError(res, empLookupError);
+    empMap = Object.fromEntries((employees || []).map(e => [e.id, e]));
+  }
+
+  const result = data.map(a => ({
+    ...a,
+    employees: empMap[a.employee_id] || null
+  }));
+
+  res.status(201).json({ imported: data.length, records: result });
 }
 
 export async function remove(req, res) {
   const { error } = await supabase.from('attendance').delete().eq('id', req.params.id);
   if (error) return handleError(res, error);
   res.json({ message: 'Record deleted' });
+}
+
+// ─── DEVICE KIOSK (fingerprint, no buttons) ─────────────────────────────────
+export async function punch(req, res) {
+  const { employee_id } = req.body;
+  if (!employee_id) return res.status(400).json({ error: 'employee_id is required' });
+
+  const today = new Date().toISOString().split('T')[0];
+  const now = new Date();
+
+  const { data: record } = await supabase
+    .from('attendance')
+    .select('id, clock_in, clock_out, lunch_start, lunch_end, coffee_start, coffee_end')
+    .eq('employee_id', employee_id)
+    .eq('date', today)
+    .maybeSingle();
+
+  if (record?.clock_in && record?.clock_out) {
+    return res.status(409).json({
+      action: 'already_done',
+      error: 'Already clocked in and out today',
+      record,
+    });
+  }
+
+  // ── CLOCK OUT branch ──────────────────────────────────────────────
+  if (record?.clock_in && !record?.clock_out) {
+    if (record.lunch_start && !record.lunch_end) {
+      return res.status(409).json({ error: 'Employee is currently on lunch break' });
+    }
+    if (record.coffee_start && !record.coffee_end) {
+      return res.status(409).json({ error: 'Employee is currently on coffee break' });
+    }
+
+    const clockOutTime = now.toTimeString().slice(0, 8);
+    const clockIn  = new Date(`${today}T${record.clock_in}`);
+    const clockOut = new Date(`${today}T${clockOutTime}`);
+    const grossMinutes = (clockOut - clockIn) / 60000;
+
+    let breakMinutes = 0;
+    if (record.lunch_start && record.lunch_end) {
+      breakMinutes += Math.round(
+        (new Date(`${today}T${record.lunch_end}`) - new Date(`${today}T${record.lunch_start}`)) / 60000
+      );
+    }
+    if (record.coffee_start && record.coffee_end) {
+      breakMinutes += Math.round(
+        (new Date(`${today}T${record.coffee_end}`) - new Date(`${today}T${record.coffee_start}`)) / 60000
+      );
+    }
+
+    const netMinutes  = grossMinutes - breakMinutes;
+    const hoursWorked = parseFloat((grossMinutes / 60).toFixed(2));
+    const netHours    = parseFloat((netMinutes / 60).toFixed(2));
+
+    const { data, error } = await supabase
+      .from('attendance')
+      .update({
+        clock_out: clockOutTime,
+        hours_worked: hoursWorked,
+        break_minutes: breakMinutes,
+        net_hours_worked: netHours,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', record.id)
+      .select()
+      .single();
+
+    if (error) return handleError(res, error);
+    
+    const { data: empData } = await supabase
+      .from('employees')
+      .select('name, employee_id, department')
+      .eq('id', employee_id)
+      .single();
+
+    return res.json({ action: 'clock_out', ...data, employees: empData || null });
+  }
+
+  // ── CLOCK IN branch ───────────────────────────────────────────────
+  const { data: activeLeave } = await supabase
+    .from('leaves')
+    .select('id, type, start_date, end_date')
+    .eq('employee_id', employee_id)
+    .eq('status', 'approved')
+    .lte('start_date', today)
+    .gte('end_date', today)
+    .maybeSingle();
+
+  if (activeLeave) {
+    return res.status(403).json({
+      error: `Employee is on approved ${activeLeave.type} leave today (${activeLeave.start_date} → ${activeLeave.end_date})`,
+    });
+  }
+  
+  const { data: todaysShift } = await supabase
+    .from('shift_assignments')
+    .select('id, is_day_off, role_id') 
+    .eq('employee_id', employee_id)
+    .eq('date', today)
+    .maybeSingle();
+
+  if (!todaysShift || todaysShift.is_day_off || !todaysShift.role_id) { 
+    return res.status(403).json({
+      error: 'No shift scheduled for today',
+    });
+  }
+
+  const { data: employee } = await supabase
+    .from('employees')
+    .select('shift_start')
+    .eq('id', employee_id)
+    .single();
+
+  let status = 'present';
+  if (employee?.shift_start) {
+    const [shiftH, shiftM] = employee.shift_start.split(':').map(Number);
+    const shiftDate = new Date(now);
+    shiftDate.setHours(shiftH, shiftM + 15, 0); // 15 min grace period
+    if (now > shiftDate) status = 'late';
+  }
+
+  const clockInTime = now.toTimeString().slice(0, 8);
+
+  const { data, error } = await supabase
+    .from('attendance')
+    .upsert(
+      [{ employee_id, date: today, clock_in: clockInTime, clock_out: null, hours_worked: null, status, notes: null }],
+      { onConflict: 'employee_id,date' }
+    )
+    .select()
+    .single();
+
+  if (error) return handleError(res, error);
+  
+  const { data: empData } = await supabase
+    .from('employees')
+    .select('name, employee_id, department')
+    .eq('id', employee_id)
+    .single();
+
+  return res.status(201).json({ action: 'clock_in', ...data, employees: empData || null });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+export async function pendingSync(req, res) {
+  const { device_id } = req.query;
+  if (!device_id) return res.status(400).json({ error: 'device_id is required' });
+
+  const { data: allEnrolled, error } = await supabase
+    .from('employee_fingerprints')
+    .select('employee_id, slot_label, device_id, template_data, employees(name)')
+    .not('template_data', 'is', null);
+
+  if (error) return handleError(res, error);
+
+  const bySlot = {};
+  for (const row of allEnrolled) {
+    const key = `${row.employee_id}:${row.slot_label}`;
+    if (!bySlot[key]) bySlot[key] = { employee_id: row.employee_id, slot_label: row.slot_label, name: row.employees.name, template_data: row.template_data, devices: [] };
+    bySlot[key].devices.push(row.device_id);
+  }
+
+  const pending = Object.values(bySlot)
+    .filter(entry => !entry.devices.includes(device_id))
+    .map(({ employee_id, slot_label, name, template_data }) => ({ employee_id, slot_label, name, template_data }));
+
+  res.json({ device_id, pending });
+}
+
+export async function registerSynced(req, res) {
+  const { employee_id, slot_label, device_id, sensor_slot_id } = req.body;
+
+  if (!employee_id || !slot_label || !device_id || sensor_slot_id === undefined) {
+    return res.status(400).json({ error: 'employee_id, slot_label, device_id, sensor_slot_id are required' });
+  }
+
+  const { data: source } = await supabase
+    .from('employee_fingerprints')
+    .select('template_data')
+    .eq('employee_id', employee_id)
+    .eq('slot_label', slot_label)
+    .not('template_data', 'is', null)
+    .limit(1)
+    .maybeSingle();
+
+  const { data, error } = await supabase
+    .from('employee_fingerprints')
+    .insert([{
+      employee_id,
+      slot_label,
+      device_id,
+      sensor_slot_id,
+      template_data: source?.template_data || null,
+    }])
+    .select()
+    .single();
+
+  if (error) return handleError(res, error);
+  res.status(201).json(data);
 }

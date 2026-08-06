@@ -1,10 +1,26 @@
-const BASE = '/api';
+import { getToken, clearSession } from '../utils/session.js';
+
+const BASE = `${import.meta.env.VITE_API_URL || ''}/api`;
 
 async function request(path, options = {}) {
+  const token = getToken();
+
   const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...options.headers },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...options.headers,
+    },
     ...options,
   });
+
+  if (res.status === 401) {
+    // Token missing/expired/invalid — the backend is the source of truth here.
+    // Clear the stale session and tell the app to show the login screen.
+    clearSession();
+    window.dispatchEvent(new CustomEvent('session-expired'));
+  }
+
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || 'Request failed');
   return data;
@@ -25,6 +41,19 @@ export const api = {
   // for 7+ consecutive working days — separate from driver inactivity below)
   checkEmployeeInactivity: () => request('/employees/check-inactivity', { method: 'POST' }),
   getEmployeeInactivityLogs: () => request('/employees/inactivity-logs'),
+  notifyInactiveEmployee: (id) => request(`/employees/${id}/notify-inactive`, { method: 'POST' }),
+
+  // Fingerprint enrollment (primary + 2 backups per employee, captured by an
+  // ESP32 + sensor terminal — see routes/fingerprints.routes.js)
+  getEmployeeFingerprints: (employeeId) => request(`/employees/${employeeId}/fingerprints`),
+  requestFingerprintEnrollment: (employeeId, slot_label) =>
+    request(`/employees/${employeeId}/fingerprints/enroll-request`, { method: 'POST', body: JSON.stringify({ slot_label }) }),
+  getFingerprintRequestStatus: (employeeId, requestId) =>
+    request(`/employees/${employeeId}/fingerprints/requests/${requestId}`),
+  cancelFingerprintRequest: (employeeId, requestId) =>
+    request(`/employees/${employeeId}/fingerprints/requests/${requestId}`, { method: 'DELETE' }),
+  deleteEmployeeFingerprint: (employeeId, fingerprintId) =>
+    request(`/employees/${employeeId}/fingerprints/${fingerprintId}`, { method: 'DELETE' }),
 
   // Attendance
   getAttendance: (params = {}) => {
@@ -53,6 +82,14 @@ export const api = {
   getSummary: (params = {}) => {
     const qs = new URLSearchParams(params).toString();
     return request(`/analytics/summary${qs ? `?${qs}` : ''}`);
+  },
+  getCutoffReport: (params = {}) => {
+    const qs = new URLSearchParams(params).toString();
+    return request(`/analytics/cutoff${qs ? `?${qs}` : ''}`);
+  },
+  getCutoffDetails: (params = {}) => {
+    const qs = new URLSearchParams(params).toString();
+    return request(`/analytics/cutoff/details${qs ? `?${qs}` : ''}`);
   },
 
   // Shift templates (reusable shift definitions, e.g. "Morning Shift" 06:00-14:00)
@@ -87,6 +124,24 @@ export const api = {
   },
   setDriverAvailability: (id, availability, reason) => request(`/employees/${id}/driver-availability`, { method: 'PATCH', body: JSON.stringify({ availability, reason }) }),
   reassignDriver: (body) => request('/employees/reassign-driver', { method: 'POST', body: JSON.stringify(body) }),
+  autoReassignDrivers: (date) => request('/employees/auto-reassign-drivers', { method: 'POST', body: JSON.stringify({ date }) }),
   getDriverReassignments: (date) => request(`/employees/reassignments${date ? `?date=${date}` : ''}`),
   deleteDriverReassignment: (id) => request(`/employees/reassignments/${id}`, { method: 'DELETE' }),
+
+  // Staffing requirements (how many of a position are needed for a given
+  // role/shift on a given date) + coverage (required vs. actually assigned)
+  getStaffingRequirements: (params = {}) => {
+    const qs = new URLSearchParams(params).toString();
+    return request(`/staffing-requirements${qs ? `?${qs}` : ''}`);
+  },
+  getCoverage: (params = {}) => {
+    const qs = new URLSearchParams(params).toString();
+    return request(`/staffing-requirements/coverage${qs ? `?${qs}` : ''}`);
+  },
+  createStaffingRequirement: (body) => request('/staffing-requirements', { method: 'POST', body: JSON.stringify(body) }),
+  createRecurringStaffingRequirement: (body) => request('/staffing-requirements/recurring', { method: 'POST', body: JSON.stringify(body) }),
+  updateStaffingRequirement: (id, body) => request(`/staffing-requirements/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
+  deleteStaffingRequirement: (id) => request(`/staffing-requirements/${id}`, { method: 'DELETE' }),
+
+  getPositions: () => request('/positions'),
 };
