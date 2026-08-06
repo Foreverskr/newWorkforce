@@ -3,10 +3,11 @@ import jwt from 'jsonwebtoken';
 import { supabase } from '../config/supabase.js';
 
 const JWT_SECRET = process.env.JWT_SECRET;
-const TOKEN_EXPIRY = '8h'; // testing only! // <- backend's source of truth for session length
+const TOKEN_EXPIRY = '8h';
 
 export async function login(req, res) {
   const { username, password } = req.body;
+  console.log('Login attempt for username:', username); // <-- add
 
   if (!username || !password) {
     return res.status(400).json({ error: 'Username and password are required' });
@@ -24,7 +25,19 @@ export async function login(req, res) {
     .eq('username', username)
     .single();
 
+  console.log('Supabase query result — admin:', admin, 'error:', error); // <-- add
+
   if (error || !admin) {
+    console.log('Login failed: admin not found or query error'); // <-- add
+    return res.status(401).json({ error: 'Invalid username or password' });
+  }
+
+  // 2. Compare password with bcrypt hash
+  const match = await bcrypt.compare(password, admin.password);
+  console.log('Password match result:', match); // <-- add
+
+  if (!match) {
+    console.log('Login failed: password mismatch'); // <-- add
     return res.status(401).json({ error: 'Invalid username or password' });
   }
 
