@@ -294,30 +294,57 @@ function DriverAvailabilityPanel({ onToast }) {
   const [drivers, setDrivers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [replacing, setReplacing] = useState(null);
+  const [collapsed, setCollapsed] = useState(false);
+  const [page, setPage] = useState(0);
+  const PAGE_SIZE = 5;
   const load = async () => { setLoading(true); try { setDrivers(await api.getFleetDrivers(date)); } catch (e) { onToast(e.message, 'error'); } finally { setLoading(false); } };
   useEffect(() => {
     load();
     const refresh = window.setInterval(load, 30000);
     return () => window.clearInterval(refresh);
   }, [date]);
+  useEffect(() => { setPage(0); }, [date]);
+  const pageCount = Math.max(1, Math.ceil(drivers.length / PAGE_SIZE));
+  useEffect(() => { if (page > pageCount - 1) setPage(pageCount - 1); }, [pageCount, page]);
+  const pagedDrivers = drivers.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE);
   return (
     <div className="card" style={{ marginBottom: 20 }}>
-      <div className="flex-between" style={{ marginBottom: 12 }}>
-        <div className="flex-center" style={{ gap: 8 }}><Truck size={16} /><strong>Fleet Driver Availability</strong>
+      <div className="flex-between" style={{ marginBottom: collapsed ? 0 : 12 }}>
+        <div className="flex-center" style={{ gap: 8 }}>
+          <button
+            className="btn btn-icon btn-ghost btn-sm"
+            onClick={() => setCollapsed(c => !c)}
+            title={collapsed ? 'Expand' : 'Collapse'}
+          >
+            {collapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+          </button>
+          <Truck size={16} /><strong>Fleet Driver Availability</strong>
           {drivers.some(d => d.needs_replacement) && <span className="flex-center" style={{ gap: 6, color: 'var(--danger, #ef4444)' }}><AlertTriangle size={14} />{drivers.filter(d => d.needs_replacement).length} need coverage</span>}
         </div>
         <input type="date" value={date} onChange={e => setDate(e.target.value)} style={{ width: 160 }} />
       </div>
-      {loading ? <div className="loading"><div className="spinner" /> Loading...</div> : (
-        <div className="table-wrap"><table><thead><tr><th>Driver</th><th>Shift</th><th>Clock In</th><th>Status</th><th>Reason</th><th>Coverage</th><th></th></tr></thead><tbody>{drivers.map(d => <tr key={d.id}><td><div style={{ fontWeight: 600 }}>{d.name}</div><div className="text-dim" style={{ fontSize: 11 }}>{d.employee_id}</div></td><td>{d.shift_name || '—'}{d.shift_start && <div className="text-dim" style={{ fontSize: 11 }}>{d.shift_start.slice(0, 5)}</div>}</td><td>{d.clock_in ? d.clock_in.slice(0, 5) : '—'}</td><td><span className={`badge ${d.effective_availability === 'available' ? 'active' : 'inactive'}`}>{d.effective_availability === 'available' ? 'Available' : 'Not Available'}</span></td><td className="text-sm">{d.availability_reason}</td><td className="text-sm">{d.coverage_status === 'active' ? <span style={{ color: 'var(--green)' }}>Covered by {d.replacement_name}</span> : d.coverage_status === 'invalid' ? <span style={{ color: 'var(--danger, #ef4444)' }}>Invalid: {d.coverage_invalid_reason}</span> : '—'}</td><td><button className={`btn btn-sm ${d.needs_replacement ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setReplacing(d)}><UserCheck size={13} /> {d.needs_replacement ? 'Replace' : 'Override'}</button></td></tr>)}</tbody></table></div>
-      )}
+      {!collapsed && (loading ? <div className="loading"><div className="spinner" /> Loading...</div> : (
+        <>
+          <div className="table-wrap"><table><thead><tr><th>Driver</th><th>Shift</th><th>Clock In</th><th>Status</th><th>Reason</th><th>Coverage</th><th></th></tr></thead><tbody>{pagedDrivers.map(d => <tr key={d.id}><td><div style={{ fontWeight: 600 }}>{d.name}</div><div className="text-dim" style={{ fontSize: 11 }}>{d.employee_id}</div></td><td>{d.shift_name || '—'}{d.shift_start && <div className="text-dim" style={{ fontSize: 11 }}>{d.shift_start.slice(0, 5)}</div>}</td><td>{d.clock_in ? d.clock_in.slice(0, 5) : '—'}</td><td><span className={`badge ${d.effective_availability === 'available' ? 'active' : 'inactive'}`}>{d.effective_availability === 'available' ? 'Available' : 'Not Available'}</span></td><td className="text-sm">{d.availability_reason}</td><td className="text-sm">{d.coverage_status === 'active' ? <span style={{ color: 'var(--green)' }}>Covered by {d.replacement_name}</span> : d.coverage_status === 'invalid' ? <span style={{ color: 'var(--danger, #ef4444)' }}>Invalid: {d.coverage_invalid_reason}</span> : '—'}</td><td><button className={`btn btn-sm ${d.needs_replacement ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setReplacing(d)}><UserCheck size={13} /> {d.needs_replacement ? 'Replace' : 'Override'}</button></td></tr>)}</tbody></table></div>
+          {drivers.length > PAGE_SIZE && (
+            <div className="flex-between" style={{ marginTop: 12 }}>
+              <span className="text-dim text-sm">{drivers.length} driver{drivers.length === 1 ? '' : 's'}</span>
+              <div className="flex-center gap-2">
+                <button className="btn btn-sm btn-ghost" onClick={() => setPage(p => Math.max(0, p - 1))} disabled={page === 0}>Previous</button>
+                <span className="text-dim text-sm">Page {page + 1} of {pageCount}</span>
+                <button className="btn btn-sm btn-ghost" onClick={() => setPage(p => Math.min(pageCount - 1, p + 1))} disabled={page >= pageCount - 1}>Next</button>
+              </div>
+            </div>
+          )}
+        </>
+      ))}
       {replacing && <ReplacementModal absentDriver={replacing} date={date} onClose={() => setReplacing(null)} onAssigned={load} onToast={onToast} />}
     </div>
   );
 }
 
 // ─── Requirements Matrix (compact, one row per shift type) ─────────────────────
-function RequirementsMatrix({ positionName, rows, dates, onCellClick }) {
+function RequirementsMatrix({ positionName, rows, dates, onCellClick, onDeleteRow }) {
   return (
     <div style={{ marginBottom: 20 }}>
       <div className="text-dim text-sm" style={{ marginBottom: 8, fontWeight: 600 }}>{positionName} requirements this week</div>
@@ -334,6 +361,7 @@ function RequirementsMatrix({ positionName, rows, dates, onCellClick }) {
                   </th>
                 );
               })}
+              <th style={{ padding: '4px 8px' }}></th>
             </tr>
           </thead>
           <tbody>
@@ -365,7 +393,7 @@ function RequirementsMatrix({ positionName, rows, dates, onCellClick }) {
                       <td key={date} style={{ textAlign: 'center', padding: 0 }}>
                         <button
                           onClick={() => onCellClick(cell)}
-                          title={`${cell.assigned_count}/${cell.required_count} filled`}
+                          title={`${cell.assigned_count}/${cell.required_count} filled — click to edit or remove`}
                           style={{
                             width: '100%', minWidth: 56, padding: '6px 4px', borderRadius: 6, border: 'none', cursor: 'pointer', fontSize: '0.8rem', fontWeight: 600,
                             background: full ? 'rgba(16,185,129,0.15)' : 'rgba(239,68,68,0.15)',
@@ -375,13 +403,23 @@ function RequirementsMatrix({ positionName, rows, dates, onCellClick }) {
                       </td>
                     );
                   })}
+                  <td style={{ textAlign: 'center', padding: '0 4px' }}>
+                    <button
+                      className="btn btn-icon btn-ghost btn-sm"
+                      onClick={() => onDeleteRow(row)}
+                      title={`Remove ${row.name} for the whole week`}
+                      style={{ color: 'var(--danger, #ef4444)' }}
+                    >
+                      <Trash2 size={13} />
+                    </button>
+                  </td>
                 </tr>
               );
             })}
           </tbody>
         </table>
       </div>
-      <p className="text-dim" style={{ fontSize: '0.72rem', marginTop: 6 }}>One row per shift type. Dashed cells mean no requirement set — click to add one for that day.</p>
+      <p className="text-dim" style={{ fontSize: '0.72rem', marginTop: 6 }}>One row per shift type. Dashed cells mean no requirement set — click a filled cell to edit or remove that single day, or use the trash icon to remove the whole week for that shift at once.</p>
     </div>
   );
 }
@@ -594,6 +632,22 @@ export default function SchedulePage({ onToast }) {
     catch (e) { onToast(e.message, 'error'); }
   };
 
+  // Removes every day's requirement for one shift row (e.g. all 7 "Morning
+  // Shift" cells) in a single action, instead of clicking each day's cell
+  // one at a time. Kept alongside the per-cell delete (via onCellClick →
+  // removeRequirement above) rather than replacing it — sometimes you only
+  // want to clear one day.
+  const deleteRequirementRow = async (row) => {
+    const cellIds = Object.values(row.cells).map(c => c.id).filter(Boolean);
+    if (cellIds.length === 0) return;
+    if (!confirm(`Remove ${row.name} for the whole week? This deletes all ${cellIds.length} day(s) of this requirement.`)) return;
+    try {
+      await Promise.all(cellIds.map(id => api.deleteStaffingRequirement(id)));
+      onToast(`${row.name} removed for the week`, 'success');
+      load();
+    } catch (e) { onToast(e.message, 'error'); }
+  };
+
   // ─── DATE RANGE ────────────────────────────────────────────────────────────
   const datesInRange = useMemo(() => {
     const dates = [];
@@ -643,6 +697,18 @@ export default function SchedulePage({ onToast }) {
       return true;
     });
   }, [positions, positionTabs]);
+
+  // For the Assign Shift filter: unlike activePositions above, this doesn't need
+  // a real `positions` table row (no staffing_requirement FK involved here — the
+  // shift assignment just stores the employee's position as text). Building it
+  // straight from positionTabs means it shows every position an active employee
+  // actually has, even if that position never got mirrored into the `positions`
+  // table (e.g. employees inserted directly into the DB rather than through the
+  // Employee Management create/update form, which is what upserts `positions`).
+  const assignablePositions = useMemo(
+    () => positionTabs.map(t => ({ id: t.name, name: t.name })),
+    [positionTabs]
+  );
 
   // ─── REQUIREMENT MODAL LOGIC ──────────────────────────────────────────────────
   // New requirements default to covering the whole visible week in one step —
@@ -734,16 +800,12 @@ export default function SchedulePage({ onToast }) {
 
   return (
     <div className="page">
-      {/* Header */}
-      <div className="flex-between" style={{ marginBottom: 24 }}>
-        <div>
-          <h2 style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.5px' }}>Shift &amp; Schedule Management</h2>
-          <p className="text-dim text-sm" style={{ marginTop: 4 }}>{assignments.filter(a => !a.is_day_off).length} shift(s) · {assignments.filter(a => a.is_day_off).length} rest day(s) scheduled</p>
-        </div>
-        <div className="flex-center gap-2">
-          <button className="btn btn-ghost" onClick={() => setShowTemplates(true)}><Clock size={14} /> Manage Templates</button>
-          <button className="btn btn-primary" onClick={() => setShowAssign(true)} disabled={employees.length === 0}><Plus size={14} /> Assign Shift</button>
-        </div>
+      {/* Header — title + subtitle only. Primary actions live in the panel toolbar below,
+          right next to the week/position context they operate on, instead of duplicated
+          up here disconnected from that context. */}
+      <div style={{ marginBottom: 24 }}>
+        <h2 style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.5px' }}>Shift &amp; Schedule Management</h2>
+        <p className="text-dim text-sm" style={{ marginTop: 4 }}>{assignments.filter(a => !a.is_day_off).length} shift(s) · {assignments.filter(a => a.is_day_off).length} rest day(s) scheduled</p>
       </div>
 
       {/* Driver Availability (Separate Card) */}
@@ -751,7 +813,7 @@ export default function SchedulePage({ onToast }) {
 
       {/* MERGED PANEL */}
       <div className="card">
-        {/* Week controls + totals */}
+        {/* Week controls + totals + all primary actions (Manage Templates, Add requirement, Assign Shift) */}
         <div className="flex-between" style={{ padding: '16px 20px', borderBottom: '1px solid var(--border)', flexWrap: 'wrap', gap: '12px' }}>
           <div className="flex-center gap-2">
             <button className="btn btn-icon btn-ghost btn-sm" onClick={() => shiftWeek(-1)}><ChevronLeft size={14} /></button>
@@ -763,6 +825,8 @@ export default function SchedulePage({ onToast }) {
             {totals.understaffed_slots > 0 && (
               <span className="flex-center" style={{ gap: 6, color: 'var(--danger, #ef4444)' }}><AlertTriangle size={14} /> {totals.understaffed_slots} short-staffed</span>
             )}
+            <span style={{ width: 1, height: 20, background: 'var(--border)', margin: '0 2px' }} />
+            <button className="btn btn-ghost btn-sm" onClick={() => setShowTemplates(true)}><Clock size={13} /> Manage Templates</button>
             <button
               className="btn btn-primary btn-sm"
               onClick={() => openReqModal({
@@ -774,6 +838,9 @@ export default function SchedulePage({ onToast }) {
               disabled={activePositions.length === 0 || templates.length === 0}
             >
               <Plus size={13} /> Add requirement
+            </button>
+            <button className="btn btn-primary btn-sm" onClick={() => setShowAssign(true)} disabled={employees.length === 0}>
+              <Plus size={13} /> Assign Shift
             </button>
           </div>
         </div>
@@ -798,6 +865,7 @@ export default function SchedulePage({ onToast }) {
                 rows={requirementRows}
                 dates={datesInRange}
                 onCellClick={openReqModal}
+                onDeleteRow={deleteRequirementRow}
               />
             )}
 
@@ -855,7 +923,7 @@ export default function SchedulePage({ onToast }) {
         <AssignShiftModal
           employees={employees}
           templates={templates}
-          positions={activePositions}
+          positions={assignablePositions}
           defaultPosition={selectedPosition}
           onClose={() => setShowAssign(false)}
           onAssign={async (b) => { await api.assignShift(b); load(); }}

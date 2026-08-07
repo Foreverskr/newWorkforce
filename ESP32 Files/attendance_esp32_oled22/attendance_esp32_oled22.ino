@@ -16,7 +16,7 @@
 // ─── CONFIG — fill these in ──────────────────────────────────────────────
 const char* WIFI_SSID      = "GlobeAtHome_12CC1_2.4";
 const char* WIFI_PASSWORD  = "3Zz2hE7B";
-const char* SERVER_URL     = "http://192.168.254.119:3001";
+const char* SERVER_URL     = "https://workforce-l51s.onrender.com";
 const char* DEVICE_API_KEY = "gpzgbwlukzkhhdzzvnfevvfifnsfshizchucptdcdqjpcjmnbgyctsuycetehdwq";
 const char* DEVICE_ID      = "ESP32-ATTEND-01";
 

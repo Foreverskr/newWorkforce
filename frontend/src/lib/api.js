@@ -107,7 +107,8 @@ export const api = {
   assignRecurringShift: (body) => request('/schedule/recurring', { method: 'POST', body: JSON.stringify(body) }),
   deleteShiftAssignment: (id) => request(`/schedule/${id}`, { method: 'DELETE' }),
 
-  // Drivers
+  // Drivers (external `drivers` table — license/trip tracking, unrelated to
+  // the fleet-driver coverage logic below)
   getDrivers: () => request('/drivers'),
   createDriver: (body) => request('/drivers', { method: 'POST', body: JSON.stringify(body) }),
   updateDriver: (id, body) => request(`/drivers/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
@@ -115,18 +116,20 @@ export const api = {
   checkDriverInactivity: () => request('/drivers/check-inactivity', { method: 'POST' }),
   getInactivityLogs: () => request('/drivers/inactivity-logs'),
 
-  // Fleet driver replacement (employees flagged is_fleet_driver — separate from the external drivers table above)
-  getFleetDrivers: (date) => request(`/employees/fleet-drivers${date ? `?date=${date}` : ''}`),
-  getAbsentDrivers: (date) => request(`/employees/absent-drivers${date ? `?date=${date}` : ''}`),
+  // Fleet driver coverage (employees with position 'Driver' — one morning
+  // driver, one night driver, one reserve driver on standby). Lives under
+  // /api/schedule since it's schedule/coverage logic, not employee CRUD.
+  getFleetDrivers: (date) => request(`/schedule/fleet-drivers${date ? `?date=${date}` : ''}`),
+  getAbsentDrivers: (date) => request(`/schedule/absent-drivers${date ? `?date=${date}` : ''}`),
   getAvailableDrivers: (date, excludeEmployeeId) => {
     const qs = new URLSearchParams({ ...(date && { date }), ...(excludeEmployeeId && { exclude_employee_id: excludeEmployeeId }) }).toString();
-    return request(`/employees/available-drivers${qs ? `?${qs}` : ''}`);
+    return request(`/schedule/available-drivers${qs ? `?${qs}` : ''}`);
   },
-  setDriverAvailability: (id, availability, reason) => request(`/employees/${id}/driver-availability`, { method: 'PATCH', body: JSON.stringify({ availability, reason }) }),
-  reassignDriver: (body) => request('/employees/reassign-driver', { method: 'POST', body: JSON.stringify(body) }),
-  autoReassignDrivers: (date) => request('/employees/auto-reassign-drivers', { method: 'POST', body: JSON.stringify({ date }) }),
-  getDriverReassignments: (date) => request(`/employees/reassignments${date ? `?date=${date}` : ''}`),
-  deleteDriverReassignment: (id) => request(`/employees/reassignments/${id}`, { method: 'DELETE' }),
+  setDriverAvailability: (id, availability, reason) => request(`/schedule/drivers/${id}/availability`, { method: 'PATCH', body: JSON.stringify({ availability, reason }) }),
+  reassignDriver: (body) => request('/schedule/reassign-driver', { method: 'POST', body: JSON.stringify(body) }),
+  autoReassignDrivers: (date) => request('/schedule/auto-reassign-drivers', { method: 'POST', body: JSON.stringify({ date }) }),
+  getDriverReassignments: (date) => request(`/schedule/reassignments${date ? `?date=${date}` : ''}`),
+  deleteDriverReassignment: (id) => request(`/schedule/reassignments/${id}`, { method: 'DELETE' }),
 
   // Staffing requirements (how many of a position are needed for a given
   // role/shift on a given date) + coverage (required vs. actually assigned)

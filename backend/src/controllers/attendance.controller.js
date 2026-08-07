@@ -45,7 +45,28 @@ export async function getAll(req, res) {
 }
 
 export async function getToday(req, res) {
-  const today = new Date().toISOString().split('T')[0];
+  const today = todayDateString();
+
+  // Company-wide headcount — shown separately on the dashboard, NOT used as
+  // the denominator for attendance rate (that would count people who aren't
+  // even scheduled to work today).
+  const { data: totalEmployees, error: empError } = await supabase
+    .from('employees')
+    .select('id', { count: 'exact' })
+    .eq('status', 'active');
+  if (empError) return handleError(res, empError);
+
+  // Who's actually scheduled today — same rule clockIn() uses to decide
+  // whether someone is allowed to clock in at all (not a day off, has a role).
+  const { data: assignments, error: assignError } = await supabase
+    .from('shift_assignments')
+    .select('employee_id')
+    .eq('date', today)
+    .eq('is_day_off', false)
+    .not('role_id', 'is', null);
+  if (assignError) return handleError(res, assignError);
+
+  const scheduledEmployeeIds = [...new Set((assignments || []).map(a => a.employee_id).filter(Boolean))];
 
   const { data: attendanceData, error: attendanceError } = await supabase
     .from('attendance')
@@ -53,15 +74,12 @@ export async function getToday(req, res) {
     .eq('date', today);
   if (attendanceError) return handleError(res, attendanceError);
 
-  const { data: totalEmployees, error: empError } = await supabase
-    .from('employees')
-    .select('id', { count: 'exact' })
-    .eq('status', 'active');
-  if (empError) return handleError(res, empError);
-
   // Batch-fetch employees in one query instead of one query per row
   // NOTE: attendance.employee_id actually stores employees.id (uuid), NOT employees.employee_id (text code)
-  const empIds = [...new Set(attendanceData.map(r => r.employee_id).filter(Boolean))];
+  const empIds = [...new Set([
+    ...attendanceData.map(r => r.employee_id),
+    ...scheduledEmployeeIds,
+  ].filter(Boolean))];
   let empMap = {};
   if (empIds.length > 0) {
     const { data: employees, error: empLookupError } = await supabase
@@ -72,21 +90,39 @@ export async function getToday(req, res) {
     empMap = Object.fromEntries((employees || []).map(e => [e.id, e]));
   }
 
-  const records = attendanceData.map(record => ({
-    ...record,
-    employees: empMap[record.employee_id] || null
-  }));
+  const attendanceByEmployee = Object.fromEntries(attendanceData.map(r => [r.employee_id, r]));
+
+  // One record per SCHEDULED employee: their real attendance row if it
+  // exists, otherwise a synthesized "absent" placeholder so someone who
+  // never clocked in still shows up in the list instead of silently
+  // disappearing from the count.
+  const records = scheduledEmployeeIds.map(employeeId => {
+    const existing = attendanceByEmployee[employeeId];
+    if (existing) {
+      return { ...existing, employees: empMap[employeeId] || null };
+    }
+    return {
+      id: `unrecorded-${employeeId}`,
+      employee_id: employeeId,
+      date: today,
+      clock_in: null,
+      clock_out: null,
+      status: 'absent',
+      employees: empMap[employeeId] || null,
+    };
+  });
 
   const present = records.filter(r => r.status === 'present').length;
   const late = records.filter(r => r.status === 'late').length;
-  const absent = (totalEmployees?.length || 0) - present - late;
+  const absent = records.filter(r => r.status === 'absent').length;
 
   res.json({
     date: today,
     total_employees: totalEmployees?.length || 0,
+    scheduled_count: scheduledEmployeeIds.length,
     present,
     late,
-    absent: absent < 0 ? 0 : absent,
+    absent,
     records,
   });
 }
@@ -95,7 +131,7 @@ export async function clockIn(req, res) {
   const { employee_id } = req.body;
   if (!employee_id) return res.status(400).json({ error: 'employee_id is required' });
 
-  const today = new Date().toISOString().split('T')[0];
+  const today = todayDateString();
   const now = new Date();
   const clockInTime = now.toTimeString().slice(0, 8);
 
@@ -114,10 +150,12 @@ export async function clockIn(req, res) {
     });
   }
 
-  // Check if they are scheduled
+  // Check if they are scheduled — also pull the shift template's start_time
+  // so late-detection below uses what they're ACTUALLY scheduled for today,
+  // not a static per-employee default (which is wrong for rotating drivers).
   const { data: todaysShift } = await supabase
     .from('shift_assignments')
-    .select('id, is_day_off, role_id')
+    .select('id, is_day_off, role_id, shift_templates:roles(start_time)')
     .eq('employee_id', employee_id)
     .eq('date', today)
     .maybeSingle();
@@ -138,16 +176,22 @@ export async function clockIn(req, res) {
     return res.status(409).json({ error: 'Already clocked in today', record: existing });
   }
 
-  // Get employee shift info to determine late status
-  const { data: employee } = await supabase
-    .from('employees')
-    .select('shift_start')
-    .eq('id', employee_id)
-    .single();
+  // Determine late status against TODAY'S actual scheduled shift start —
+  // falls back to the employee's default shift_start only if the shift
+  // template somehow has no start_time set.
+  let shiftStart = todaysShift.shift_templates?.start_time;
+  if (!shiftStart) {
+    const { data: employee } = await supabase
+      .from('employees')
+      .select('shift_start')
+      .eq('id', employee_id)
+      .single();
+    shiftStart = employee?.shift_start;
+  }
 
   let status = 'present';
-  if (employee?.shift_start) {
-    const [shiftH, shiftM] = employee.shift_start.split(':').map(Number);
+  if (shiftStart) {
+    const [shiftH, shiftM] = shiftStart.split(':').map(Number);
     const shiftDate = new Date(now);
     shiftDate.setHours(shiftH, shiftM + 15, 0); // 15 min grace period
     if (now > shiftDate) status = 'late';
@@ -177,7 +221,7 @@ export async function clockOut(req, res) {
   const { employee_id } = req.body;
   if (!employee_id) return res.status(400).json({ error: 'employee_id is required' });
 
-  const today = new Date().toISOString().split('T')[0];
+  const today = todayDateString();
   const clockOutTime = new Date().toTimeString().slice(0, 8);
 
   const { data: record } = await supabase
@@ -249,7 +293,7 @@ export async function breakStart(req, res) {
   const { employee_id } = req.body;
   if (!employee_id) return res.status(400).json({ error: 'employee_id is required' });
 
-  const today = new Date().toISOString().split('T')[0];
+  const today = todayDateString();
   const now   = new Date().toTimeString().slice(0, 8);
 
   const { data: record } = await supabase
@@ -300,7 +344,7 @@ export async function breakEnd(req, res) {
   const { employee_id } = req.body;
   if (!employee_id) return res.status(400).json({ error: 'employee_id is required' });
 
-  const today = new Date().toISOString().split('T')[0];
+  const today = todayDateString();
   const now   = new Date().toTimeString().slice(0, 8);
 
   const { data: record } = await supabase
@@ -443,7 +487,7 @@ export async function punch(req, res) {
   const { employee_id } = req.body;
   if (!employee_id) return res.status(400).json({ error: 'employee_id is required' });
 
-  const today = new Date().toISOString().split('T')[0];
+  const today = todayDateString();
   const now = new Date();
 
   const { data: record } = await supabase
@@ -533,7 +577,7 @@ export async function punch(req, res) {
   
   const { data: todaysShift } = await supabase
     .from('shift_assignments')
-    .select('id, is_day_off, role_id') 
+    .select('id, is_day_off, role_id, shift_templates:roles(start_time)') 
     .eq('employee_id', employee_id)
     .eq('date', today)
     .maybeSingle();
@@ -544,15 +588,22 @@ export async function punch(req, res) {
     });
   }
 
-  const { data: employee } = await supabase
-    .from('employees')
-    .select('shift_start')
-    .eq('id', employee_id)
-    .single();
+  // Determine late status against TODAY'S actual scheduled shift start —
+  // falls back to the employee's default shift_start only if the shift
+  // template somehow has no start_time set.
+  let shiftStart = todaysShift.shift_templates?.start_time;
+  if (!shiftStart) {
+    const { data: employee } = await supabase
+      .from('employees')
+      .select('shift_start')
+      .eq('id', employee_id)
+      .single();
+    shiftStart = employee?.shift_start;
+  }
 
   let status = 'present';
-  if (employee?.shift_start) {
-    const [shiftH, shiftM] = employee.shift_start.split(':').map(Number);
+  if (shiftStart) {
+    const [shiftH, shiftM] = shiftStart.split(':').map(Number);
     const shiftDate = new Date(now);
     shiftDate.setHours(shiftH, shiftM + 15, 0); // 15 min grace period
     if (now > shiftDate) status = 'late';

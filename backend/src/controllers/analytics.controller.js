@@ -3,6 +3,19 @@ import { handleError } from '../middleware/errorHandler.js';
 
 const PAGE_SIZE = 1000; // Supabase/PostgREST caps a single response at 1000 rows
 
+// A `notes?.includes('approved')` check wrongly counts negated phrasing as
+// excused, since e.g. "leave not approved" and "still pending approved by HR"
+// both contain the substring "approved". This checks for the word "approved"
+// while excluding common negated forms first. Still a text heuristic — a
+// structured `excused` column (or a leave_id FK) on `attendance` would be a
+// more reliable long-term fix than pattern-matching free-text notes at all.
+function isExcusedNote(notes) {
+  if (!notes) return false;
+  const text = notes.toLowerCase();
+  if (/\b(not|un|dis)[\s-]*approved\b/.test(text)) return false;
+  return /\bapproved\b/.test(text);
+}
+
 // Fetches every attendance row in the date range, paging past Supabase's
 // default 1000-row response cap so totals stay correct on wide date ranges.
 async function fetchAllAttendance(start, end) {
@@ -64,7 +77,7 @@ export async function getSummary(req, res) {
   const present = data.filter(r => r.status === 'present').length;
   const late = data.filter(r => r.status === 'late').length;
   const absent = data.filter(r => r.status === 'absent').length;
-  const excused = data.filter(r => r.status === 'absent' && r.notes?.includes('approved')).length;
+  const excused = data.filter(r => r.status === 'absent' && isExcusedNote(r.notes)).length;
   const unexcused = absent - excused;
   const totalHours = data.reduce((sum, r) => sum + (r.hours_worked || 0), 0);
 
@@ -105,7 +118,7 @@ export async function getSummary(req, res) {
       e.late++;
     } else if (r.status === 'absent') {
       e.absent++;
-      if (r.notes?.includes('approved')) e.excused++;
+      if (isExcusedNote(r.notes)) e.excused++;
       else e.unexcused++;
     }
     e.totalHours += r.hours_worked || 0;
@@ -174,7 +187,7 @@ function calculateStats(data) {
   const present = data.filter(r => r.status === 'present').length;
   const late = data.filter(r => r.status === 'late').length;
   const absent = data.filter(r => r.status === 'absent').length;
-  const excused = data.filter(r => r.status === 'absent' && r.notes?.includes('approved')).length;
+  const excused = data.filter(r => r.status === 'absent' && isExcusedNote(r.notes)).length;
   const unexcused = absent - excused;
   const totalHours = data.reduce((sum, r) => sum + (r.hours_worked || 0), 0);
   const avgHoursPerDay = totalRecords > 0 ? totalHours / totalRecords : 0;
@@ -242,7 +255,7 @@ function getByEmployee(data) {
       e.late++;
     } else if (r.status === 'absent') {
       e.absent++;
-      if (r.notes?.includes('approved')) e.excused++;
+      if (isExcusedNote(r.notes)) e.excused++;
       else e.unexcused++;
     }
     e.totalHours += r.hours_worked || 0;
