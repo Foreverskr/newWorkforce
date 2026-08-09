@@ -4,6 +4,7 @@ import {
   LayoutDashboard, Users, Clock, Calendar, BarChart2, FileText
 } from 'lucide-react';
 import { format } from 'date-fns';
+import tripwiseLogo from '../../picture/tripwise_icon.png';
 
 const navItems = [
   { to: '/',           label: 'Dashboard',        icon: LayoutDashboard },
@@ -27,8 +28,13 @@ export default function Sidebar() {
   return (
     <aside className="sidebar">
       <div className="sidebar-logo">
-        <h1>Attend<span>Track</span></h1>
-        <p>Workforce Management</p>
+        <div className="sidebar-brand-mark" aria-hidden="true">
+          <img src={tripwiseLogo} alt="" />
+        </div>
+        <div className="sidebar-brand-copy">
+          <h1>Trip<span>Wise</span></h1>
+          <p>Workforce Management</p>
+        </div>
       </div>
 
       <nav className="sidebar-nav">

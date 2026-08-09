@@ -1,4 +1,4 @@
-import { Routes, Route } from "react-router-dom";
+import { Routes, Route, useLocation } from "react-router-dom";
 import { useState, useEffect, useCallback, useRef } from "react";
 import { LogOut, Menu, Moon, Settings, Sun, User } from "lucide-react";
 import Sidebar from "./components/Sidebar.jsx";
@@ -26,6 +26,7 @@ function AppContent() {
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const profileMenuRef = useRef(null);
   const { theme, toggleTheme } = useTheme();
+  const location = useLocation();
 
   const [isLoggedIn, setIsLoggedIn] = useState(() => {
     const session = getSession();
@@ -98,6 +99,17 @@ function AppContent() {
   const hour = new Date().getHours();
   const greeting =
     hour < 12 ? "Good Morning" : hour < 18 ? "Good Afternoon" : "Good Evening";
+  const pageTitles = {
+    "/": "Dashboard",
+    "/clock": "Clock In / Out",
+    "/attendance": "Timesheet Management",
+    "/employees": "Status & Biometrics Management",
+    "/schedule": "Shift & Schedule Management",
+    "/leaves": "Leave Management",
+    "/drivers": "Drivers",
+    "/analytics": "Analytics",
+  };
+  const pageTitle = pageTitles[location.pathname] || "Dashboard";
 
   return (
     <div className={`layout ${sidebarOpen ? "" : "sidebar-collapsed"}`}>
@@ -114,6 +126,7 @@ function AppContent() {
             >
               <Menu size={18} />
             </button>
+            <span className="topbar-title">{pageTitle}</span>
           </div>
           <div className="topbar-actions">
             <span className="topbar-greeting">
