@@ -129,6 +129,70 @@ function ManualModal({ employees, onClose, onSave }) {
   );
 }
 
+function ExportPasswordModal({ onClose, onConfirm }) {
+  const [password, setPassword] = useState('');
+  const [confirm, setConfirm] = useState('');
+  const [exporting, setExporting] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async () => {
+    if (password.length < 4) { setError('Password must be at least 4 characters'); return; }
+    if (password !== confirm) { setError('Passwords do not match'); return; }
+    setError('');
+    setExporting(true);
+    try {
+      await onConfirm(password);
+      onClose();
+    } catch (e) {
+      setError(e.message || 'Export failed');
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  return (
+    <div className="modal-overlay">
+      <div className="modal">
+        <div className="modal-header">
+          <span className="modal-title">Set Export Password</span>
+          <button className="btn btn-icon btn-ghost" onClick={onClose}>✕</button>
+        </div>
+        <div className="form-grid">
+          <div className="form-group full">
+            <label>Password</label>
+            <input
+              type="password"
+              value={password}
+              onChange={e => setPassword(e.target.value)}
+              placeholder="At least 4 characters"
+              autoFocus
+            />
+          </div>
+          <div className="form-group full">
+            <label>Confirm Password</label>
+            <input
+              type="password"
+              value={confirm}
+              onChange={e => setConfirm(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && submit()}
+            />
+          </div>
+          {error && <div className="form-group full" style={{ color: '#c0392b' }}>{error}</div>}
+          <div className="form-group full" style={{ fontSize: '0.85em', opacity: 0.75 }}>
+            This password will be required to open the exported Excel file. Share it with the recipient separately (not in the same email as the file).
+          </div>
+        </div>
+        <div className="modal-footer">
+          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary" onClick={submit} disabled={exporting}>
+            {exporting ? 'Exporting…' : 'Export'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function AttendancePage({ onToast }) {
   const [records, setRecords] = useState([]);
   const [employees, setEmployees] = useState([]);
@@ -140,6 +204,7 @@ export default function AttendancePage({ onToast }) {
   });
   const [search, setSearch] = useState('');
   const [showModal, setShowModal] = useState(false);
+  const [showExportModal, setShowExportModal] = useState(false);
   const [importing, setImporting] = useState(false);
   const [rowsPerPage, setRowsPerPage] = useState(10);
   const [currentPage, setCurrentPage] = useState(1);
@@ -194,8 +259,16 @@ export default function AttendancePage({ onToast }) {
 
   const setF = k => e => setFilters(f => ({ ...f, [k]: e.target.value }));
 
-  // Export currently filtered records to .xlsx — opens fine in Excel or Google Sheets (File > Import)
+  // Export currently filtered records. Opens the password modal first — the
+  // actual .xlsx file is built and encrypted on the server (see api.exportAttendance),
+  // since real password protection needs Node's crypto module, not something
+  // the browser-side `xlsx` package can do.
   const handleExport = () => {
+    if (filtered.length === 0) { onToast('No records to export', 'error'); return; }
+    setShowExportModal(true);
+  };
+
+  const doExport = async (password) => {
     const rows = filtered.map(r => ({
       'Employee Name': r.employees?.name || '',
       'Employee Code': r.employees?.employee_id || '',
@@ -208,15 +281,19 @@ export default function AttendancePage({ onToast }) {
       'Notes': r.notes || '',
     }));
 
-    if (rows.length === 0) { onToast('No records to export', 'error'); return; }
-
-    const ws = XLSX.utils.json_to_sheet(rows);
-    ws['!cols'] = [{ wch: 20 }, { wch: 14 }, { wch: 16 }, { wch: 12 }, { wch: 10 }, { wch: 10 }, { wch: 8 }, { wch: 10 }, { wch: 24 }];
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Attendance');
     const filename = `attendance_${filters.start_date}_to_${filters.end_date}.xlsx`;
-    XLSX.writeFile(wb, filename);
-    onToast(`Exported ${rows.length} record(s)`, 'success');
+    const blob = await api.exportAttendance(rows, password, filename);
+
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    window.URL.revokeObjectURL(url);
+    document.body.removeChild(a);
+
+    onToast(`Exported ${rows.length} record(s), password-protected`, 'success');
   };
 
   // Import from an .xlsx/.xls/.csv file (works with files exported from Excel or Google Sheets).
@@ -434,6 +511,13 @@ export default function AttendancePage({ onToast }) {
               load();
             } catch(e) { onToast(e.message, 'error'); throw e; }
           }}
+        />
+      )}
+
+      {showExportModal && (
+        <ExportPasswordModal
+          onClose={() => setShowExportModal(false)}
+          onConfirm={doExport}
         />
       )}
     </div>

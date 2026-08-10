@@ -1,5 +1,6 @@
 import { supabase } from '../config/supabase.js';
 import { handleError } from '../middleware/errorHandler.js';
+import XlsxPopulate from 'xlsx-populate';
 
 export function todayDateString(timeZone = 'Asia/Manila') {
   return new Intl.DateTimeFormat('en-CA', { timeZone }).format(new Date());
@@ -474,6 +475,55 @@ export async function bulkImport(req, res) {
   }));
 
   res.status(201).json({ imported: data.length, records: result });
+}
+
+// ─── PASSWORD-PROTECTED EXCEL EXPORT ────────────────────────────────────────
+// Client sends the already-filtered/formatted rows (same shape it used to
+// hand straight to XLSX.writeFile) plus a password HR types in at export
+// time. We build the workbook here and encrypt it with xlsx-populate, since
+// that requires Node's crypto module — the browser-side `xlsx` package can
+// only write plain, unprotected files.
+export async function exportExcel(req, res) {
+  const { rows, password, filename } = req.body;
+
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return res.status(400).json({ error: 'No rows to export' });
+  }
+  if (!password || typeof password !== 'string' || password.length < 4) {
+    return res.status(400).json({ error: 'A password of at least 4 characters is required' });
+  }
+
+  try {
+    const workbook = await XlsxPopulate.fromBlankAsync();
+    const sheet = workbook.sheet(0).name('Attendance');
+
+    const headers = Object.keys(rows[0]);
+    headers.forEach((header, col) => {
+      const cell = sheet.cell(1, col + 1);
+      cell.value(header);
+      cell.style({ bold: true });
+    });
+
+    rows.forEach((row, r) => {
+      headers.forEach((header, c) => {
+        sheet.cell(r + 2, c + 1).value(row[header] ?? '');
+      });
+    });
+
+    headers.forEach((_, col) => sheet.column(col + 1).width(18));
+
+    const buffer = await workbook.outputAsync({ password });
+
+    const safeName = (filename || 'attendance_export.xlsx').replace(/[^\w.\-]/g, '_');
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
+    res.send(buffer);
+  } catch (error) {
+    return handleError(res, error);
+  }
 }
 
 export async function remove(req, res) {

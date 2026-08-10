@@ -147,4 +147,31 @@ export const api = {
   deleteStaffingRequirement: (id) => request(`/staffing-requirements/${id}`, { method: 'DELETE' }),
 
   getPositions: () => request('/positions'),
+
+  // Excel export is a blob response (not JSON), so it can't go through the
+  // shared request() helper above — but it still needs the same base URL,
+  // auth header, and 401 handling.
+  async exportAttendance(rows, password, filename) {
+    const token = getToken();
+    const res = await fetch(`${BASE}/attendance/export`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ rows, password, filename }),
+    });
+
+    if (res.status === 401) {
+      clearSession();
+      window.dispatchEvent(new CustomEvent('session-expired'));
+    }
+
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || 'Export failed');
+    }
+
+    return res.blob();
+  },
 };

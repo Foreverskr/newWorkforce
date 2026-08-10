@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import {
-  getAll, getToday, clockIn, clockOut, breakStart, breakEnd, create, remove, bulkImport,
+  getAll, getToday, clockIn, clockOut, breakStart, breakEnd, create, remove, bulkImport, exportExcel 
 } from '../controllers/attendance.controller.js';
 
 const router = Router();
@@ -14,6 +14,7 @@ router.put('/clock-out', clockOut);
 router.post('/break-start', breakStart);
 router.post('/break-end', breakEnd);
 
+router.post('/export', exportExcel);
 router.post('/bulk-import', bulkImport);
 router.post('/', create);
 router.delete('/:id', remove);
