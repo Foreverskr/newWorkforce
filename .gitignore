@@ -3,8 +3,7 @@ node_modules/
 **/node_modules/
 
 # Environment files
-.env
-**/.envgit 
+
 
 # Build output
 dist/
