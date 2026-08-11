@@ -4,11 +4,12 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 COPY . .
-RUN npm run build
 
 # Accept Build Argument
 ARG VITE_API_URL=https://workforce.tripwisetnvs.tech/api
 ENV VITE_API_URL=https://workforce.tripwisetnvs.tech/api
+
+RUN npm run build
 
 # --- Serve stage ---
 FROM nginx:alpine
