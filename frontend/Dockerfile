@@ -7,8 +7,8 @@ COPY . .
 RUN npm run build
 
 # Accept Build Argument
-ARG VITE_API_URL
-ENV VITE_API_URL=$VITE_API_URL
+ARG VITE_API_URL=https://workforce.tripwisetnvs.tech/api
+ENV VITE_API_URL=https://workforce.tripwisetnvs.tech/api
 
 # --- Serve stage ---
 FROM nginx:alpine
