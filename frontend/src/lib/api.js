@@ -1,6 +1,8 @@
 import { getToken, clearSession } from '../utils/session.js';
 
-const BASE = import.meta.env.VITE_API_URL || '/api';
+// ✅ Bulletproof BASE path: automatically handles relative '/api' or absolute 'https://.../api' without double /api/api
+const rawUrl = import.meta.env.VITE_API_URL || '/api';
+const BASE = rawUrl.endsWith('/api') ? rawUrl : `${rawUrl.replace(/\/+$/, '')}/api`;
 
 async function request(path, options = {}) {
   const token = getToken();
@@ -37,14 +39,12 @@ export const api = {
   updateEmployee: (id, body) => request(`/employees/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
   deleteEmployee: (id) => request(`/employees/${id}`, { method: 'DELETE' }),
 
-  // Employee attendance inactivity (flags employees with no attendance record
-  // for 7+ consecutive working days — separate from driver inactivity below)
+  // Employee attendance inactivity
   checkEmployeeInactivity: () => request('/employees/check-inactivity', { method: 'POST' }),
   getEmployeeInactivityLogs: () => request('/employees/inactivity-logs'),
   notifyInactiveEmployee: (id) => request(`/employees/${id}/notify-inactive`, { method: 'POST' }),
 
-  // Fingerprint enrollment (primary + 2 backups per employee, captured by an
-  // ESP32 + sensor terminal — see routes/fingerprints.routes.js)
+  // Fingerprint enrollment
   getEmployeeFingerprints: (employeeId) => request(`/employees/${employeeId}/fingerprints`),
   requestFingerprintEnrollment: (employeeId, slot_label) =>
     request(`/employees/${employeeId}/fingerprints/enroll-request`, { method: 'POST', body: JSON.stringify({ slot_label }) }),
@@ -92,13 +92,13 @@ export const api = {
     return request(`/analytics/cutoff/details${qs ? `?${qs}` : ''}`);
   },
 
-  // Shift templates (reusable shift definitions, e.g. "Morning Shift" 06:00-14:00)
+  // Shift templates
   getShiftTemplates: () => request('/shift-templates'),
   createShiftTemplate: (body) => request('/shift-templates', { method: 'POST', body: JSON.stringify(body) }),
   updateShiftTemplate: (id, body) => request(`/shift-templates/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
   deleteShiftTemplate: (id) => request(`/shift-templates/${id}`, { method: 'DELETE' }),
 
-  // Schedule (which employee has which shift template on which date)
+  // Schedule
   getSchedule: (params = {}) => {
     const qs = new URLSearchParams(params).toString();
     return request(`/schedule${qs ? `?${qs}` : ''}`);
@@ -107,8 +107,7 @@ export const api = {
   assignRecurringShift: (body) => request('/schedule/recurring', { method: 'POST', body: JSON.stringify(body) }),
   deleteShiftAssignment: (id) => request(`/schedule/${id}`, { method: 'DELETE' }),
 
-  // Drivers (external `drivers` table — license/trip tracking, unrelated to
-  // the fleet-driver coverage logic below)
+  // Drivers
   getDrivers: () => request('/drivers'),
   createDriver: (body) => request('/drivers', { method: 'POST', body: JSON.stringify(body) }),
   updateDriver: (id, body) => request(`/drivers/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
@@ -116,9 +115,7 @@ export const api = {
   checkDriverInactivity: () => request('/drivers/check-inactivity', { method: 'POST' }),
   getInactivityLogs: () => request('/drivers/inactivity-logs'),
 
-  // Fleet driver coverage (employees with position 'Driver' — one morning
-  // driver, one night driver, one reserve driver on standby). Lives under
-  // /api/schedule since it's schedule/coverage logic, not employee CRUD.
+  // Fleet driver coverage
   getFleetDrivers: (date) => request(`/schedule/fleet-drivers${date ? `?date=${date}` : ''}`),
   getAbsentDrivers: (date) => request(`/schedule/absent-drivers${date ? `?date=${date}` : ''}`),
   getAvailableDrivers: (date, excludeEmployeeId) => {
@@ -131,8 +128,7 @@ export const api = {
   getDriverReassignments: (date) => request(`/schedule/reassignments${date ? `?date=${date}` : ''}`),
   deleteDriverReassignment: (id) => request(`/schedule/reassignments/${id}`, { method: 'DELETE' }),
 
-  // Staffing requirements (how many of a position are needed for a given
-  // role/shift on a given date) + coverage (required vs. actually assigned)
+  // Staffing requirements
   getStaffingRequirements: (params = {}) => {
     const qs = new URLSearchParams(params).toString();
     return request(`/staffing-requirements${qs ? `?${qs}` : ''}`);
@@ -148,9 +144,7 @@ export const api = {
 
   getPositions: () => request('/positions'),
 
-  // Excel export is a blob response (not JSON), so it can't go through the
-  // shared request() helper above — but it still needs the same base URL,
-  // auth header, and 401 handling.
+  // Excel export
   async exportAttendance(rows, password, filename) {
     const token = getToken();
     const res = await fetch(`${BASE}/attendance/export`, {
