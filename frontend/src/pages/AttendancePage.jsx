@@ -226,6 +226,14 @@ export default function AttendancePage({ onToast }) {
 
   useEffect(() => { load(); }, [load]);
 
+  useEffect(() => {
+    const source = new EventSource('/api/events');
+    source.addEventListener('attendance:updated', () => {
+      load();
+    });
+    return () => source.close();
+  }, [load]);
+
   const del = async (id) => {
     if (!confirm('Delete this record?')) return;
     try {

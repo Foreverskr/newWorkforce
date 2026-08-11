@@ -122,6 +122,15 @@ export default function Dashboard() {
   useEffect(() => { load(); loadWeekly(); }, [load, loadWeekly]);
 
   useEffect(() => {
+    const source = new EventSource('/api/events');
+    source.addEventListener('attendance:updated', () => {
+      load();
+      loadWeekly();
+    });
+    return () => source.close();
+  }, [load, loadWeekly]);
+
+  useEffect(() => {
     if (!autoRefresh) return;
     const id = setInterval(load, 30000);
     return () => clearInterval(id);

@@ -1,6 +1,7 @@
 import { supabase } from '../config/supabase.js';
 import { handleError } from '../middleware/errorHandler.js';
 import XlsxPopulate from 'xlsx-populate';
+import { broadcastSseEvent } from '../utils/sse.js';
 
 export function todayDateString(timeZone = 'Asia/Manila') {
   return new Intl.DateTimeFormat('en-CA', { timeZone }).format(new Date());
@@ -215,6 +216,12 @@ export async function clockIn(req, res) {
     .eq('id', employee_id)
     .single();
 
+  broadcastSseEvent('attendance:updated', {
+    type: 'clock-in',
+    record: { ...data, employees: empData || null },
+    timestamp: new Date().toISOString(),
+  });
+
   res.status(201).json({ ...data, employees: empData || null });
 }
 
@@ -285,6 +292,12 @@ export async function clockOut(req, res) {
     .eq('id', employee_id)
     .single();
 
+  broadcastSseEvent('attendance:updated', {
+    type: 'clock-out',
+    record: { ...data, employees: empData || null },
+    timestamp: new Date().toISOString(),
+  });
+
   res.json({ ...data, employees: empData || null });
 }
 
@@ -338,6 +351,12 @@ export async function breakStart(req, res) {
     .eq('id', employee_id)
     .single();
 
+  broadcastSseEvent('attendance:updated', {
+    type: 'break-change',
+    record: { ...data, employees: empData || null },
+    timestamp: new Date().toISOString(),
+  });
+
   res.json({ breakType, record: { ...data, employees: empData || null } });
 }
 
@@ -386,6 +405,12 @@ export async function breakEnd(req, res) {
     .eq('id', employee_id)
     .single();
 
+  broadcastSseEvent('attendance:updated', {
+    type: 'break-change',
+    record: { ...data, employees: empData || null },
+    timestamp: new Date().toISOString(),
+  });
+
   res.json({ breakType, record: { ...data, employees: empData || null } });
 }
 
@@ -414,6 +439,12 @@ export async function create(req, res) {
     .select('name, employee_id, department')
     .eq('id', employee_id)
     .single();
+
+  broadcastSseEvent('attendance:updated', {
+    type: 'manual-create',
+    record: { ...data, employees: empData || null },
+    timestamp: new Date().toISOString(),
+  });
 
   res.status(201).json({ ...data, employees: empData || null });
 }
@@ -474,6 +505,12 @@ export async function bulkImport(req, res) {
     employees: empMap[a.employee_id] || null
   }));
 
+  broadcastSseEvent('attendance:updated', {
+    type: 'bulk-import',
+    records: result,
+    timestamp: new Date().toISOString(),
+  });
+
   res.status(201).json({ imported: data.length, records: result });
 }
 
@@ -529,6 +566,12 @@ export async function exportExcel(req, res) {
 export async function remove(req, res) {
   const { error } = await supabase.from('attendance').delete().eq('id', req.params.id);
   if (error) return handleError(res, error);
+  broadcastSseEvent('attendance:updated', {
+    type: 'delete',
+    id: req.params.id,
+    timestamp: new Date().toISOString(),
+  });
+
   res.json({ message: 'Record deleted' });
 }
 

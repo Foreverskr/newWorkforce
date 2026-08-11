@@ -91,6 +91,20 @@ export default function AnalyticsPage({ onToast }) {
     loadOverview();
   }, [range]);
 
+  useEffect(() => {
+    const source = new EventSource('/api/events');
+    source.addEventListener('attendance:updated', () => {
+      if (view === 'overview') {
+        loadOverview();
+      } else if (view === 'cutoff-monthly') {
+        loadCutoffReport();
+      } else if (view === 'cutoff-detail') {
+        loadCutoffDetail(selectedCutoff);
+      }
+    });
+    return () => source.close();
+  }, [view, range, selectedYear, selectedMonth, selectedCutoff]);
+
   const pieData = summary ? [
     { name: 'Present', value: summary.totals.present, color: COLORS.present },
     { name: 'Late', value: summary.totals.late, color: COLORS.late },

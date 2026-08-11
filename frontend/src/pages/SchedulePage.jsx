@@ -300,8 +300,14 @@ function DriverAvailabilityPanel({ onToast }) {
   const load = async () => { setLoading(true); try { setDrivers(await api.getFleetDrivers(date)); } catch (e) { onToast(e.message, 'error'); } finally { setLoading(false); } };
   useEffect(() => {
     load();
-    const refresh = window.setInterval(load, 30000);
-    return () => window.clearInterval(refresh);
+  }, [date]);
+
+  useEffect(() => {
+    const source = new EventSource('/api/events');
+    source.addEventListener('attendance:updated', () => {
+      load();
+    });
+    return () => source.close();
   }, [date]);
   useEffect(() => { setPage(0); }, [date]);
   const pageCount = Math.max(1, Math.ceil(drivers.length / PAGE_SIZE));
@@ -612,6 +618,14 @@ export default function SchedulePage({ onToast }) {
   };
 
   useEffect(() => { load(); }, [range.start, range.end]);
+
+  useEffect(() => {
+    const source = new EventSource('/api/events');
+    source.addEventListener('attendance:updated', () => {
+      load();
+    });
+    return () => source.close();
+  }, [range.start, range.end]);
 
   const saveTemplate = async (id, form) => {
     if (id) { const updated = await api.updateShiftTemplate(id, form); setTemplates(ts => ts.map(t => t.id === id ? updated : t)); }

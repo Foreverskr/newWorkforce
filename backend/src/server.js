@@ -19,6 +19,7 @@ import healthRoutes from './routes/health.routes.js';
 import analyticsRoutes from './routes/analytics.routes.js';
 import fingerprintsRoutes from './routes/fingerprints.routes.js';
 import deviceRoutes from './routes/device.routes.js';
+import eventsRoutes from './routes/events.routes.js';
 import './jobs/reconcileAttendanceCron.js';
 
 const app = express();
@@ -30,6 +31,7 @@ app.use(express.json());
 // Public routes — no token required
 app.use('/api/auth', authRoutes);
 app.use('/api/health', healthRoutes);
+app.use('/api/events', eventsRoutes);
 
 // Device routes — auth'd via a shared device key (see middleware/deviceAuth.js),
 // NOT a user JWT, since the ESP32 never logs in as an admin/employee.
