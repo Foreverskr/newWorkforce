@@ -14,6 +14,8 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        VITE_API_URL: https://workforce.tripwisetnvs.tech/api
     container_name: workforce-frontend
     ports:
       - "8080:80"
