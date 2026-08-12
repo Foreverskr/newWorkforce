@@ -2,10 +2,289 @@ import { supabase } from '../config/supabase.js';
 import { handleError } from '../middleware/errorHandler.js';
 import XlsxPopulate from 'xlsx-populate';
 import { broadcastSseEvent } from '../utils/sse.js';
+import {
+  getBreakPolicies,
+  getNextAction,
+  creditedBreakMinutes,
+  invalidateBreakPolicyCache,
+} from '../services/breakEngine.js';
 
 export function todayDateString(timeZone = 'Asia/Manila') {
   return new Intl.DateTimeFormat('en-CA', { timeZone }).format(new Date());
 }
+
+function timeToMinutes(t) {
+  const [h, m] = t.split(':').map(Number);
+  return h * 60 + m;
+}
+
+// ─── kiosk scan safety: serialize + debounce ───────────────────────────────
+// Two scans for the same employee arriving close together (a finger
+// lingering on the sensor, a device retry, an unsure double-tap) can both
+// read the punch list before either insert lands, then both compute the
+// SAME "next action" and both write — corrupting the sequence (e.g. a break
+// gets logged twice instead of the cycle advancing). Two things fix this:
+//   1. withEmployeeLock() serializes recordPunch() calls per employee so a
+//      second call always sees the first call's write.
+//   2. The debounce check below then treats a second scan that lands within
+//      DEBOUNCE_SECONDS of the last recorded punch as an accidental repeat,
+//      not a new step, and just echoes back the current state.
+// Note: the lock is in-process only — fine for a single kiosk backend
+// instance, but won't coordinate across multiple server processes.
+const DEBOUNCE_SECONDS = 5 ; // 5 minutes (was 4s) — testing a longer duplicate-scan window
+const employeeLocks = new Map();
+
+function withEmployeeLock(employee_id, fn) {
+  const prior = employeeLocks.get(employee_id) || Promise.resolve();
+  const run = prior.then(fn, fn);
+  employeeLocks.set(employee_id, run.catch(() => {}));
+  return run;
+}
+
+function secondsBetween(t1, t2) {
+  const toSeconds = t => {
+    const [h, m, s] = t.split(':').map(Number);
+    return h * 3600 + m * 60 + (s || 0);
+  };
+  return Math.abs(toSeconds(t1) - toSeconds(t2));
+}
+
+// ─── shared helpers ─────────────────────────────────────────────────────────
+
+async function getPunches(attendance_id) {
+  const { data, error } = await supabase
+    .from('attendance_punches')
+    .select('*')
+    .eq('attendance_id', attendance_id)
+    .order('sequence', { ascending: true });
+  if (error) throw error;
+  return data || [];
+}
+
+async function getTodaysAttendanceWithPunches(employee_id, date) {
+  const { data: attendance, error } = await supabase
+    .from('attendance')
+    .select('*')
+    .eq('employee_id', employee_id)
+    .eq('date', date)
+    .maybeSingle();
+  if (error) throw error;
+  if (!attendance) return { attendance: null, punches: [] };
+  const punches = await getPunches(attendance.id);
+  return { attendance, punches };
+}
+
+async function getEmployeeShiftForDate(employee_id, date) {
+  const { data: todaysShift } = await supabase
+    .from('shift_assignments')
+    .select('id, is_day_off, role_id, shift_templates:roles(start_time, end_time)')
+    .eq('employee_id', employee_id)
+    .eq('date', date)
+    .maybeSingle();
+  return todaysShift;
+}
+
+async function resolveShiftStart(employee_id, todaysShift) {
+  let shiftStart = todaysShift?.shift_templates?.start_time;
+  if (!shiftStart) {
+    const { data: employee } = await supabase
+      .from('employees')
+      .select('shift_start')
+      .eq('id', employee_id)
+      .single();
+    shiftStart = employee?.shift_start;
+  }
+  return shiftStart;
+}
+
+async function fetchEmployeeSummary(employee_id) {
+  const { data } = await supabase
+    .from('employees')
+    .select('name, employee_id, department')
+    .eq('id', employee_id)
+    .single();
+  return data || null;
+}
+
+// Batch-attach punches to a list of attendance-shaped records (skips
+// synthesized "unrecorded-*" absent placeholders, which have no real row).
+async function attachPunches(records) {
+  const ids = records.map(r => r.id).filter(id => typeof id === 'string' && !id.startsWith('unrecorded-'));
+  if (ids.length === 0) return records.map(r => ({ ...r, punches: [] }));
+
+  const { data: allPunches, error } = await supabase
+    .from('attendance_punches')
+    .select('*')
+    .in('attendance_id', ids)
+    .order('sequence', { ascending: true });
+  if (error) throw error;
+
+  const byAttendance = {};
+  for (const p of allPunches || []) {
+    (byAttendance[p.attendance_id] ||= []).push(p);
+  }
+  return records.map(r => ({ ...r, punches: byAttendance[r.id] || [] }));
+}
+
+/**
+ * Insert the next punch for an employee/date and update the attendance
+ * summary row accordingly. This is the single engine behind clockIn,
+ * clockOut, breakStart, breakEnd, and the kiosk punch() endpoint.
+ *
+ * `validateAction(action) => string | null` — optional guard. Receives the
+ * auto-detected next action BEFORE anything is written; return an error
+ * string to reject (used by the legacy endpoints to enforce that "Clock
+ * Out" can't accidentally end a break, etc). Return null/undefined to allow.
+ * Omit entirely for auto-detect-only callers (the kiosk).
+ */
+async function recordPunch(args) {
+  // Serialize all punches for this employee so two near-simultaneous scans
+  // can never both read the same "current" state and both write.
+  return withEmployeeLock(args.employee_id, () => recordPunchLocked(args));
+}
+
+async function recordPunchLocked({ employee_id, date, punchTime, validateAction = null, isAutomatic = false }) {
+  const policies = await getBreakPolicies();
+  const { attendance, punches } = await getTodaysAttendanceWithPunches(employee_id, date);
+
+  // A scan that lands within DEBOUNCE_SECONDS of the last recorded punch is
+  // treated as an accidental repeat (lingering finger / device retry), not
+  // a new step — echo back the current state instead of advancing.
+  if (punches.length > 0) {
+    const lastPunch = punches[punches.length - 1];
+    if (secondsBetween(lastPunch.punch_time, punchTime) < DEBOUNCE_SECONDS) {
+      return {
+        attendance,
+        punches,
+        action: { punch_type: null, break_type: null, is_final: false, meaning: 'duplicate_ignored' },
+        duplicate: true,
+      };
+    }
+  }
+
+  const action = getNextAction(punches, policies);
+
+  if (action.meaning === 'already_finalized') {
+    const err = new Error('Attendance already finalized for today');
+    err.status = 409;
+    throw err;
+  }
+
+  if (validateAction) {
+    const message = validateAction(action);
+    if (message) {
+      const err = new Error(message);
+      err.status = 409;
+      err.nextAction = action.meaning;
+      throw err;
+    }
+  }
+
+  let attendanceRow = attendance;
+
+  // First punch of the day → create the attendance record (same
+  // scheduling / leave checks the old clockIn() did).
+  if (!attendanceRow) {
+    const todaysShift = await getEmployeeShiftForDate(employee_id, date);
+    if (!todaysShift || todaysShift.is_day_off || !todaysShift.role_id) {
+      const err = new Error('No shift scheduled for today — contact your admin to get scheduled before clocking in.');
+      err.status = 403;
+      throw err;
+    }
+
+    const { data: activeLeave } = await supabase
+      .from('leaves')
+      .select('id, type, start_date, end_date')
+      .eq('employee_id', employee_id)
+      .eq('status', 'approved')
+      .lte('start_date', date)
+      .gte('end_date', date)
+      .maybeSingle();
+    if (activeLeave) {
+      const err = new Error(`Employee is on approved ${activeLeave.type} leave today (${activeLeave.start_date} → ${activeLeave.end_date})`);
+      err.status = 403;
+      throw err;
+    }
+
+    const shiftStart = await resolveShiftStart(employee_id, todaysShift);
+    let status = 'present';
+    if (shiftStart) {
+      const graceLimitMinutes = timeToMinutes(shiftStart.slice(0, 5)) + 15;
+      if (timeToMinutes(punchTime.slice(0, 5)) > graceLimitMinutes) status = 'late';
+    }
+
+    const { data: created, error: createError } = await supabase
+      .from('attendance')
+      .insert([{
+        employee_id, date, clock_in: punchTime, clock_out: null,
+        hours_worked: null, break_minutes: 0, net_hours_worked: null,
+        status, notes: null, auto_clock_out: false, is_finalized: false,
+      }])
+      .select()
+      .single();
+    if (createError) throw createError;
+    attendanceRow = created;
+  }
+
+  const nextSequence = punches.length + 1;
+  const { data: punchRow, error: punchError } = await supabase
+    .from('attendance_punches')
+    .insert([{
+      attendance_id: attendanceRow.id,
+      sequence: nextSequence,
+      punch_type: action.punch_type,
+      punch_time: punchTime,
+      break_type: action.break_type,
+      is_final: action.is_final,
+      is_automatic: isAutomatic,
+    }])
+    .select()
+    .single();
+  if (punchError) throw punchError;
+
+  const allPunches = [...punches, punchRow];
+
+  if (action.is_final) {
+    // Final OUT → close out the day's summary numbers.
+    const firstIn = allPunches[0];
+    const grossMinutes = timeToMinutes(punchTime.slice(0, 5)) - timeToMinutes(firstIn.punch_time.slice(0, 5));
+    const credited = creditedBreakMinutes(allPunches, policies);
+    const netMinutes = grossMinutes - credited;
+
+    const { data: updated, error: updateError } = await supabase
+      .from('attendance')
+      .update({
+        clock_out: punchTime,
+        hours_worked: parseFloat((grossMinutes / 60).toFixed(2)),
+        break_minutes: credited,
+        net_hours_worked: parseFloat((netMinutes / 60).toFixed(2)),
+        is_finalized: true,
+        auto_clock_out: isAutomatic,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', attendanceRow.id)
+      .select()
+      .single();
+    if (updateError) throw updateError;
+    attendanceRow = updated;
+  } else if (action.punch_type === 'in' && action.break_type) {
+    // A break just ended — keep break_minutes current for the live dashboard
+    // even before the final clock-out happens.
+    const creditedSoFar = creditedBreakMinutes(allPunches, policies);
+    const { data: updated, error: updateError } = await supabase
+      .from('attendance')
+      .update({ break_minutes: creditedSoFar, updated_at: new Date().toISOString() })
+      .eq('id', attendanceRow.id)
+      .select()
+      .single();
+    if (updateError) throw updateError;
+    attendanceRow = updated;
+  }
+
+  return { attendance: attendanceRow, punches: allPunches, action };
+}
+
+// ─── read endpoints ─────────────────────────────────────────────────────────
 
 export async function getAll(req, res) {
   const { employee_id, date, start_date, end_date, status } = req.query;
@@ -25,8 +304,6 @@ export async function getAll(req, res) {
   const { data, error } = await query;
   if (error) return handleError(res, error);
 
-  // Batch-fetch employees in one query instead of one query per row
-  // NOTE: attendance.employee_id actually stores employees.id (uuid), NOT employees.employee_id (text code)
   const empIds = [...new Set(data.map(r => r.employee_id).filter(Boolean))];
   let empMap = {};
   if (empIds.length > 0) {
@@ -34,32 +311,31 @@ export async function getAll(req, res) {
       .from('employees')
       .select('id, employee_id, name, department, position, shift_start, shift_end')
       .in('id', empIds);
-    if (empError) return handleError(res, empError); // don't swallow this — RLS / permission errors were being hidden here
+    if (empError) return handleError(res, empError);
     empMap = Object.fromEntries((employees || []).map(e => [e.id, e]));
   }
 
-  const result = data.map(record => ({
-    ...record,
-    employees: empMap[record.employee_id] || null
-  }));
-
-  res.json(result);
+  try {
+    const withPunches = await attachPunches(data);
+    const result = withPunches.map(record => ({
+      ...record,
+      employees: empMap[record.employee_id] || null,
+    }));
+    res.json(result);
+  } catch (err) {
+    return handleError(res, err);
+  }
 }
 
 export async function getToday(req, res) {
   const today = todayDateString();
 
-  // Company-wide headcount — shown separately on the dashboard, NOT used as
-  // the denominator for attendance rate (that would count people who aren't
-  // even scheduled to work today).
   const { data: totalEmployees, error: empError } = await supabase
     .from('employees')
     .select('id', { count: 'exact' })
     .eq('status', 'active');
   if (empError) return handleError(res, empError);
 
-  // Who's actually scheduled today — same rule clockIn() uses to decide
-  // whether someone is allowed to clock in at all (not a day off, has a role).
   const { data: assignments, error: assignError } = await supabase
     .from('shift_assignments')
     .select('employee_id')
@@ -76,8 +352,6 @@ export async function getToday(req, res) {
     .eq('date', today);
   if (attendanceError) return handleError(res, attendanceError);
 
-  // Batch-fetch employees in one query instead of one query per row
-  // NOTE: attendance.employee_id actually stores employees.id (uuid), NOT employees.employee_id (text code)
   const empIds = [...new Set([
     ...attendanceData.map(r => r.employee_id),
     ...scheduledEmployeeIds,
@@ -88,141 +362,73 @@ export async function getToday(req, res) {
       .from('employees')
       .select('id, employee_id, name, department, shift_start, shift_end')
       .in('id', empIds);
-    if (empLookupError) return handleError(res, empLookupError); // surfaces RLS / permission issues instead of hiding them
+    if (empLookupError) return handleError(res, empLookupError);
     empMap = Object.fromEntries((employees || []).map(e => [e.id, e]));
   }
 
-  const attendanceByEmployee = Object.fromEntries(attendanceData.map(r => [r.employee_id, r]));
+  try {
+    const attendanceWithPunches = await attachPunches(attendanceData);
+    const attendanceByEmployee = Object.fromEntries(attendanceWithPunches.map(r => [r.employee_id, r]));
 
-  // One record per SCHEDULED employee: their real attendance row if it
-  // exists, otherwise a synthesized "absent" placeholder so someone who
-  // never clocked in still shows up in the list instead of silently
-  // disappearing from the count.
-  const records = scheduledEmployeeIds.map(employeeId => {
-    const existing = attendanceByEmployee[employeeId];
-    if (existing) {
-      return { ...existing, employees: empMap[employeeId] || null };
-    }
-    return {
-      id: `unrecorded-${employeeId}`,
-      employee_id: employeeId,
+    const records = scheduledEmployeeIds.map(employeeId => {
+      const existing = attendanceByEmployee[employeeId];
+      if (existing) {
+        return { ...existing, employees: empMap[employeeId] || null };
+      }
+      return {
+        id: `unrecorded-${employeeId}`,
+        employee_id: employeeId,
+        date: today,
+        clock_in: null,
+        clock_out: null,
+        status: 'absent',
+        punches: [],
+        employees: empMap[employeeId] || null,
+      };
+    });
+
+    const present = records.filter(r => r.status === 'present').length;
+    const late = records.filter(r => r.status === 'late').length;
+    const absent = records.filter(r => r.status === 'absent').length;
+
+    res.json({
       date: today,
-      clock_in: null,
-      clock_out: null,
-      status: 'absent',
-      employees: empMap[employeeId] || null,
-    };
-  });
-
-  const present = records.filter(r => r.status === 'present').length;
-  const late = records.filter(r => r.status === 'late').length;
-  const absent = records.filter(r => r.status === 'absent').length;
-
-  res.json({
-    date: today,
-    total_employees: totalEmployees?.length || 0,
-    scheduled_count: scheduledEmployeeIds.length,
-    present,
-    late,
-    absent,
-    records,
-  });
+      total_employees: totalEmployees?.length || 0,
+      scheduled_count: scheduledEmployeeIds.length,
+      present,
+      late,
+      absent,
+      records,
+    });
+  } catch (err) {
+    return handleError(res, err);
+  }
 }
+
+// ─── punch endpoints (web dashboard buttons) ───────────────────────────────
 
 export async function clockIn(req, res) {
   const { employee_id } = req.body;
   if (!employee_id) return res.status(400).json({ error: 'employee_id is required' });
 
   const today = todayDateString();
-  const now = new Date();
-  const clockInTime = now.toTimeString().slice(0, 8);
+  const punchTime = new Date().toTimeString().slice(0, 8);
 
-  // Block clock-in if employee has an approved leave covering today
-  const { data: activeLeave } = await supabase
-    .from('leaves')
-    .select('id, type, start_date, end_date')
-    .eq('employee_id', employee_id)
-    .eq('status', 'approved')
-    .lte('start_date', today)
-    .gte('end_date', today)
-    .maybeSingle();
-  if (activeLeave) {
-    return res.status(403).json({
-      error: `Employee is on approved ${activeLeave.type} leave today (${activeLeave.start_date} → ${activeLeave.end_date})`,
+  try {
+    const { attendance, punches } = await recordPunch({
+      employee_id, date: today, punchTime,
+      validateAction: action => action.meaning !== 'shift_start'
+        ? `Already clocked in for today — next valid action is "${action.meaning}"`
+        : null,
     });
+    const empData = await fetchEmployeeSummary(employee_id);
+    const payload = { ...attendance, employees: empData, punches };
+    broadcastSseEvent('attendance:updated', { type: 'clock-in', record: payload, timestamp: new Date().toISOString() });
+    res.status(201).json(payload);
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message, nextAction: err.nextAction });
+    return handleError(res, err);
   }
-
-  // Check if they are scheduled — also pull the shift template's start_time
-  // so late-detection below uses what they're ACTUALLY scheduled for today,
-  // not a static per-employee default (which is wrong for rotating drivers).
-  const { data: todaysShift } = await supabase
-    .from('shift_assignments')
-    .select('id, is_day_off, role_id, shift_templates:roles(start_time)')
-    .eq('employee_id', employee_id)
-    .eq('date', today)
-    .maybeSingle();
-  if (!todaysShift || todaysShift.is_day_off || !todaysShift.role_id) {
-    return res.status(403).json({
-      error: 'No shift scheduled for today — contact your admin to get scheduled before clocking in.',
-    });
-  }
-
-  // Check if already clocked in today
-  const { data: existing } = await supabase
-    .from('attendance')
-    .select('id, clock_in, clock_out')
-    .eq('employee_id', employee_id)
-    .eq('date', today)
-    .maybeSingle();
-  if (existing?.clock_in) {
-    return res.status(409).json({ error: 'Already clocked in today', record: existing });
-  }
-
-  // Determine late status against TODAY'S actual scheduled shift start —
-  // falls back to the employee's default shift_start only if the shift
-  // template somehow has no start_time set.
-  let shiftStart = todaysShift.shift_templates?.start_time;
-  if (!shiftStart) {
-    const { data: employee } = await supabase
-      .from('employees')
-      .select('shift_start')
-      .eq('id', employee_id)
-      .single();
-    shiftStart = employee?.shift_start;
-  }
-
-  let status = 'present';
-  if (shiftStart) {
-    const [shiftH, shiftM] = shiftStart.split(':').map(Number);
-    const shiftDate = new Date(now);
-    shiftDate.setHours(shiftH, shiftM + 15, 0); // 15 min grace period
-    if (now > shiftDate) status = 'late';
-  }
-
-  const { data, error } = await supabase
-    .from('attendance')
-    .upsert(
-      [{ employee_id, date: today, clock_in: clockInTime, clock_out: null, hours_worked: null, status, notes: null }],
-      { onConflict: 'employee_id,date' }
-    )
-    .select()
-    .single();
-  if (error) return handleError(res, error);
-
-  // ⚡ MANUAL EMPLOYEE FETCH
-  const { data: empData } = await supabase
-    .from('employees')
-    .select('name, employee_id, department')
-    .eq('id', employee_id)
-    .single();
-
-  broadcastSseEvent('attendance:updated', {
-    type: 'clock-in',
-    record: { ...data, employees: empData || null },
-    timestamp: new Date().toISOString(),
-  });
-
-  res.status(201).json({ ...data, employees: empData || null });
 }
 
 export async function clockOut(req, res) {
@@ -230,134 +436,53 @@ export async function clockOut(req, res) {
   if (!employee_id) return res.status(400).json({ error: 'employee_id is required' });
 
   const today = todayDateString();
-  const clockOutTime = new Date().toTimeString().slice(0, 8);
+  const punchTime = new Date().toTimeString().slice(0, 8);
 
-  const { data: record } = await supabase
-    .from('attendance')
-    .select('id, clock_in, clock_out, lunch_start, lunch_end, coffee_start, coffee_end')
-    .eq('employee_id', employee_id)
-    .eq('date', today)
-    .single();
-
-  if (!record) return res.status(404).json({ error: 'No clock-in record found for today' });
-  if (record.clock_out) return res.status(409).json({ error: 'Already clocked out today' });
-
-  // Block if currently on a break
-  if (record.lunch_start && !record.lunch_end)
-    return res.status(409).json({ error: 'Employee is currently on lunch break — end break first' });
-  if (record.coffee_start && !record.coffee_end)
-    return res.status(409).json({ error: 'Employee is currently on coffee break — end break first' });
-
-  // Calculate gross hours
-  const clockIn  = new Date(`${today}T${record.clock_in}`);
-  const clockOut = new Date(`${today}T${clockOutTime}`);
-  const grossMinutes = (clockOut - clockIn) / 60000;
-
-  // Calculate actual break minutes taken
-  let breakMinutes = 0;
-  if (record.lunch_start && record.lunch_end) {
-    const ls = new Date(`${today}T${record.lunch_start}`);
-    const le = new Date(`${today}T${record.lunch_end}`);
-    breakMinutes += Math.round((le - ls) / 60000);
+  try {
+    const { attendance, punches } = await recordPunch({
+      employee_id, date: today, punchTime,
+      validateAction: action => {
+        if (!action.punch_type) return 'No clock-in record found for today';
+        if (!action.is_final) return `Employee still has "${action.meaning}" pending before final clock-out`;
+        return null;
+      },
+    });
+    const empData = await fetchEmployeeSummary(employee_id);
+    const payload = { ...attendance, employees: empData, punches };
+    broadcastSseEvent('attendance:updated', { type: 'clock-out', record: payload, timestamp: new Date().toISOString() });
+    res.json(payload);
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message, nextAction: err.nextAction });
+    return handleError(res, err);
   }
-  if (record.coffee_start && record.coffee_end) {
-    const cs = new Date(`${today}T${record.coffee_start}`);
-    const ce = new Date(`${today}T${record.coffee_end}`);
-    breakMinutes += Math.round((ce - cs) / 60000);
-  }
-
-  const netMinutes   = grossMinutes - breakMinutes;
-  const hoursWorked  = parseFloat((grossMinutes / 60).toFixed(2));
-  const netHours     = parseFloat((netMinutes   / 60).toFixed(2));
-
-  const { data, error } = await supabase
-    .from('attendance')
-    .update({
-      clock_out:        clockOutTime,
-      hours_worked:     hoursWorked,
-      break_minutes:    breakMinutes,
-      net_hours_worked: netHours,
-      updated_at:       new Date().toISOString(),
-    })
-    .eq('id', record.id)
-    .select()
-    .single();
-
-  if (error) return handleError(res, error);
-
-  // Fetch employee name manually
-  const { data: empData } = await supabase
-    .from('employees')
-    .select('name, employee_id, department')
-    .eq('id', employee_id)
-    .single();
-
-  broadcastSseEvent('attendance:updated', {
-    type: 'clock-out',
-    record: { ...data, employees: empData || null },
-    timestamp: new Date().toISOString(),
-  });
-
-  res.json({ ...data, employees: empData || null });
 }
 
-// ─── BREAKS ──────────────────────────────────────────────────────────────────
+// ─── BREAKS ─────────────────────────────────────────────────────────────────
 
 export async function breakStart(req, res) {
   const { employee_id } = req.body;
   if (!employee_id) return res.status(400).json({ error: 'employee_id is required' });
 
   const today = todayDateString();
-  const now   = new Date().toTimeString().slice(0, 8);
+  const punchTime = new Date().toTimeString().slice(0, 8);
 
-  const { data: record } = await supabase
-    .from('attendance')
-    .select('id, clock_in, clock_out, lunch_start, lunch_end, coffee_start, coffee_end')
-    .eq('employee_id', employee_id)
-    .eq('date', today)
-    .maybeSingle();
-
-  if (!record?.clock_in)  return res.status(404).json({ error: 'Employee has not clocked in today' });
-  if (record.clock_out)   return res.status(409).json({ error: 'Employee has already clocked out' });
-
-  if (record.lunch_start  && !record.lunch_end)  return res.status(409).json({ error: 'Already on lunch break' });
-  if (record.coffee_start && !record.coffee_end) return res.status(409).json({ error: 'Already on coffee break' });
-
-  let breakType = null;
-  let updatePayload = {};
-
-  if (!record.lunch_start) {
-    breakType = 'lunch';
-    updatePayload = { lunch_start: now };
-  } else if (!record.coffee_start) {
-    breakType = 'coffee';
-    updatePayload = { coffee_start: now };
-  } else {
-    return res.status(409).json({ error: 'All breaks already used for today' });
+  try {
+    const { attendance, punches, action } = await recordPunch({
+      employee_id, date: today, punchTime,
+      validateAction: action => {
+        if (!action.punch_type) return 'Employee has not clocked in today';
+        if (action.punch_type !== 'out' || action.is_final) return `Next valid action is "${action.meaning}", not a break start`;
+        return null;
+      },
+    });
+    const empData = await fetchEmployeeSummary(employee_id);
+    const payload = { ...attendance, employees: empData, punches };
+    broadcastSseEvent('attendance:updated', { type: 'break-change', record: payload, timestamp: new Date().toISOString() });
+    res.json({ breakType: action.break_type, record: payload });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message, nextAction: err.nextAction });
+    return handleError(res, err);
   }
-
-  const { data, error } = await supabase
-    .from('attendance')
-    .update({ ...updatePayload, updated_at: new Date().toISOString() })
-    .eq('id', record.id)
-    .select()
-    .single();
-
-  if (error) return handleError(res, error);
-  
-  const { data: empData } = await supabase
-    .from('employees')
-    .select('name, employee_id, department')
-    .eq('id', employee_id)
-    .single();
-
-  broadcastSseEvent('attendance:updated', {
-    type: 'break-change',
-    record: { ...data, employees: empData || null },
-    timestamp: new Date().toISOString(),
-  });
-
-  res.json({ breakType, record: { ...data, employees: empData || null } });
 }
 
 export async function breakEnd(req, res) {
@@ -365,56 +490,29 @@ export async function breakEnd(req, res) {
   if (!employee_id) return res.status(400).json({ error: 'employee_id is required' });
 
   const today = todayDateString();
-  const now   = new Date().toTimeString().slice(0, 8);
+  const punchTime = new Date().toTimeString().slice(0, 8);
 
-  const { data: record } = await supabase
-    .from('attendance')
-    .select('id, clock_in, clock_out, lunch_start, lunch_end, coffee_start, coffee_end')
-    .eq('employee_id', employee_id)
-    .eq('date', today)
-    .maybeSingle();
-
-  if (!record?.clock_in) return res.status(404).json({ error: 'Employee has not clocked in today' });
-  if (record.clock_out)  return res.status(409).json({ error: 'Employee has already clocked out' });
-
-  let breakType = null;
-  let updatePayload = {};
-
-  if (record.lunch_start && !record.lunch_end) {
-    breakType = 'lunch';
-    updatePayload = { lunch_end: now };
-  } else if (record.coffee_start && !record.coffee_end) {
-    breakType = 'coffee';
-    updatePayload = { coffee_end: now };
-  } else {
-    return res.status(409).json({ error: 'No active break to end' });
+  try {
+    const { attendance, punches, action } = await recordPunch({
+      employee_id, date: today, punchTime,
+      validateAction: action => {
+        if (!action.punch_type) return 'Employee has not clocked in today';
+        if (action.punch_type !== 'in' || !action.break_type) return `Next valid action is "${action.meaning}", not a break end`;
+        return null;
+      },
+    });
+    const empData = await fetchEmployeeSummary(employee_id);
+    const payload = { ...attendance, employees: empData, punches };
+    broadcastSseEvent('attendance:updated', { type: 'break-change', record: payload, timestamp: new Date().toISOString() });
+    res.json({ breakType: action.break_type, record: payload });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message, nextAction: err.nextAction });
+    return handleError(res, err);
   }
-
-  const { data, error } = await supabase
-    .from('attendance')
-    .update({ ...updatePayload, updated_at: new Date().toISOString() })
-    .eq('id', record.id)
-    .select()
-    .single();
-
-  if (error) return handleError(res, error);
-
-  const { data: empData } = await supabase
-    .from('employees')
-    .select('name, employee_id, department')
-    .eq('id', employee_id)
-    .single();
-
-  broadcastSseEvent('attendance:updated', {
-    type: 'break-change',
-    record: { ...data, employees: empData || null },
-    timestamp: new Date().toISOString(),
-  });
-
-  res.json({ breakType, record: { ...data, employees: empData || null } });
 }
 
-// POST manual attendance (admin)
+// ─── admin: manual create / bulk import / delete (unchanged in spirit) ────
+
 export async function create(req, res) {
   const { employee_id, date, clock_in, clock_out, status, notes } = req.body;
   if (!employee_id || !date) return res.status(400).json({ error: 'employee_id and date required' });
@@ -428,17 +526,16 @@ export async function create(req, res) {
 
   const { data, error } = await supabase
     .from('attendance')
-    .upsert([{ employee_id, date, clock_in, clock_out, status: status || 'present', notes, hours_worked: hoursWorked }], { onConflict: 'employee_id,date' })
+    .upsert([{
+      employee_id, date, clock_in, clock_out, status: status || 'present', notes,
+      hours_worked: hoursWorked, is_finalized: !!clock_out,
+    }], { onConflict: 'employee_id,date' })
     .select()
     .single();
 
   if (error) return handleError(res, error);
 
-  const { data: empData } = await supabase
-    .from('employees')
-    .select('name, employee_id, department')
-    .eq('id', employee_id)
-    .single();
+  const empData = await fetchEmployeeSummary(employee_id);
 
   broadcastSseEvent('attendance:updated', {
     type: 'manual-create',
@@ -449,7 +546,6 @@ export async function create(req, res) {
   res.status(201).json({ ...data, employees: empData || null });
 }
 
-// POST bulk import
 export async function bulkImport(req, res) {
   const { records } = req.body;
 
@@ -477,6 +573,7 @@ export async function bulkImport(req, res) {
       status: r.status || 'present',
       notes: r.notes || null,
       hours_worked: hoursWorked,
+      is_finalized: !!r.clock_out,
     };
   });
 
@@ -487,8 +584,6 @@ export async function bulkImport(req, res) {
 
   if (error) return handleError(res, error);
 
-  // Fetch employee names for the bulk list
-  // NOTE: attendance.employee_id actually stores employees.id (uuid), NOT employees.employee_id (text code)
   const empIds = [...new Set(data.map(a => a.employee_id).filter(Boolean))];
   let empMap = {};
   if (empIds.length > 0) {
@@ -500,10 +595,7 @@ export async function bulkImport(req, res) {
     empMap = Object.fromEntries((employees || []).map(e => [e.id, e]));
   }
 
-  const result = data.map(a => ({
-    ...a,
-    employees: empMap[a.employee_id] || null
-  }));
+  const result = data.map(a => ({ ...a, employees: empMap[a.employee_id] || null }));
 
   broadcastSseEvent('attendance:updated', {
     type: 'bulk-import',
@@ -514,12 +606,8 @@ export async function bulkImport(req, res) {
   res.status(201).json({ imported: data.length, records: result });
 }
 
-// ─── PASSWORD-PROTECTED EXCEL EXPORT ────────────────────────────────────────
-// Client sends the already-filtered/formatted rows (same shape it used to
-// hand straight to XLSX.writeFile) plus a password HR types in at export
-// time. We build the workbook here and encrypt it with xlsx-populate, since
-// that requires Node's crypto module — the browser-side `xlsx` package can
-// only write plain, unprotected files.
+// ─── PASSWORD-PROTECTED EXCEL EXPORT (unchanged) ───────────────────────────
+
 export async function exportExcel(req, res) {
   const { rows, password, filename } = req.body;
 
@@ -552,10 +640,7 @@ export async function exportExcel(req, res) {
     const buffer = await workbook.outputAsync({ password });
 
     const safeName = (filename || 'attendance_export.xlsx').replace(/[^\w.\-]/g, '_');
-    res.setHeader(
-      'Content-Type',
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-    );
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
     res.send(buffer);
   } catch (error) {
@@ -575,156 +660,67 @@ export async function remove(req, res) {
   res.json({ message: 'Record deleted' });
 }
 
-// ─── DEVICE KIOSK (fingerprint, no buttons) ─────────────────────────────────
+// ─── DEVICE KIOSK (fingerprint, no buttons) ────────────────────────────────
+// Every punch auto-detects its own meaning via the break-policy state
+// machine — first punch of the day is IN, then alternating OUT/IN through
+// each configured break, then a final OUT once all breaks are used.
+
 export async function punch(req, res) {
   const { employee_id } = req.body;
   if (!employee_id) return res.status(400).json({ error: 'employee_id is required' });
 
   const today = todayDateString();
-  const now = new Date();
+  const punchTime = new Date().toTimeString().slice(0, 8);
 
-  const { data: record } = await supabase
-    .from('attendance')
-    .select('id, clock_in, clock_out, lunch_start, lunch_end, coffee_start, coffee_end')
-    .eq('employee_id', employee_id)
-    .eq('date', today)
-    .maybeSingle();
+  try {
+    const { attendance, punches, action, duplicate } = await recordPunch({ employee_id, date: today, punchTime });
+    const empData = await fetchEmployeeSummary(employee_id);
+    const payload = { ...attendance, employees: empData, punches };
 
-  if (record?.clock_in && record?.clock_out) {
-    return res.status(409).json({
-      action: 'already_done',
-      error: 'Already clocked in and out today',
-      record,
-    });
-  }
-
-  // ── CLOCK OUT branch ──────────────────────────────────────────────
-  if (record?.clock_in && !record?.clock_out) {
-    if (record.lunch_start && !record.lunch_end) {
-      return res.status(409).json({ error: 'Employee is currently on lunch break' });
-    }
-    if (record.coffee_start && !record.coffee_end) {
-      return res.status(409).json({ error: 'Employee is currently on coffee break' });
+    if (duplicate) {
+      // Nothing changed — don't broadcast, just tell the kiosk what state
+      // the employee is already in so it can show the right message.
+      return res.status(200).json({ action: action.meaning, ...payload });
     }
 
-    const clockOutTime = now.toTimeString().slice(0, 8);
-    const clockIn  = new Date(`${today}T${record.clock_in}`);
-    const clockOut = new Date(`${today}T${clockOutTime}`);
-    const grossMinutes = (clockOut - clockIn) / 60000;
+    const sseType = action.is_final ? 'clock-out' : (punches.length === 1 ? 'clock-in' : 'break-change');
+    broadcastSseEvent('attendance:updated', { type: sseType, record: payload, timestamp: new Date().toISOString() });
 
-    let breakMinutes = 0;
-    if (record.lunch_start && record.lunch_end) {
-      breakMinutes += Math.round(
-        (new Date(`${today}T${record.lunch_end}`) - new Date(`${today}T${record.lunch_start}`)) / 60000
-      );
-    }
-    if (record.coffee_start && record.coffee_end) {
-      breakMinutes += Math.round(
-        (new Date(`${today}T${record.coffee_end}`) - new Date(`${today}T${record.coffee_start}`)) / 60000
-      );
-    }
-
-    const netMinutes  = grossMinutes - breakMinutes;
-    const hoursWorked = parseFloat((grossMinutes / 60).toFixed(2));
-    const netHours    = parseFloat((netMinutes / 60).toFixed(2));
-
-    const { data, error } = await supabase
-      .from('attendance')
-      .update({
-        clock_out: clockOutTime,
-        hours_worked: hoursWorked,
-        break_minutes: breakMinutes,
-        net_hours_worked: netHours,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', record.id)
-      .select()
-      .single();
-
-    if (error) return handleError(res, error);
-    
-    const { data: empData } = await supabase
-      .from('employees')
-      .select('name, employee_id, department')
-      .eq('id', employee_id)
-      .single();
-
-    return res.json({ action: 'clock_out', ...data, employees: empData || null });
+    const statusCode = action.meaning === 'shift_start' ? 201 : 200;
+    res.status(statusCode).json({ action: action.meaning, ...payload });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ action: 'error', error: err.message });
+    return handleError(res, err);
   }
-
-  // ── CLOCK IN branch ───────────────────────────────────────────────
-  const { data: activeLeave } = await supabase
-    .from('leaves')
-    .select('id, type, start_date, end_date')
-    .eq('employee_id', employee_id)
-    .eq('status', 'approved')
-    .lte('start_date', today)
-    .gte('end_date', today)
-    .maybeSingle();
-
-  if (activeLeave) {
-    return res.status(403).json({
-      error: `Employee is on approved ${activeLeave.type} leave today (${activeLeave.start_date} → ${activeLeave.end_date})`,
-    });
-  }
-  
-  const { data: todaysShift } = await supabase
-    .from('shift_assignments')
-    .select('id, is_day_off, role_id, shift_templates:roles(start_time)') 
-    .eq('employee_id', employee_id)
-    .eq('date', today)
-    .maybeSingle();
-
-  if (!todaysShift || todaysShift.is_day_off || !todaysShift.role_id) { 
-    return res.status(403).json({
-      error: 'No shift scheduled for today',
-    });
-  }
-
-  // Determine late status against TODAY'S actual scheduled shift start —
-  // falls back to the employee's default shift_start only if the shift
-  // template somehow has no start_time set.
-  let shiftStart = todaysShift.shift_templates?.start_time;
-  if (!shiftStart) {
-    const { data: employee } = await supabase
-      .from('employees')
-      .select('shift_start')
-      .eq('id', employee_id)
-      .single();
-    shiftStart = employee?.shift_start;
-  }
-
-  let status = 'present';
-  if (shiftStart) {
-    const [shiftH, shiftM] = shiftStart.split(':').map(Number);
-    const shiftDate = new Date(now);
-    shiftDate.setHours(shiftH, shiftM + 15, 0); // 15 min grace period
-    if (now > shiftDate) status = 'late';
-  }
-
-  const clockInTime = now.toTimeString().slice(0, 8);
-
-  const { data, error } = await supabase
-    .from('attendance')
-    .upsert(
-      [{ employee_id, date: today, clock_in: clockInTime, clock_out: null, hours_worked: null, status, notes: null }],
-      { onConflict: 'employee_id,date' }
-    )
-    .select()
-    .single();
-
-  if (error) return handleError(res, error);
-  
-  const { data: empData } = await supabase
-    .from('employees')
-    .select('name, employee_id, department')
-    .eq('id', employee_id)
-    .single();
-
-  return res.status(201).json({ action: 'clock_in', ...data, employees: empData || null });
 }
 
-// ─────────────────────────────────────────────────────────────────────────
+// ─── break policy config (admin) ───────────────────────────────────────────
+
+export async function getBreakPolicyConfig(req, res) {
+  const { data, error } = await supabase
+    .from('break_policies')
+    .select('*')
+    .order('sequence', { ascending: true });
+  if (error) return handleError(res, error);
+  res.json(data);
+}
+
+export async function updateBreakPolicyConfig(req, res) {
+  const { policies } = req.body; // [{ name, label, duration_minutes, sequence, active }]
+  if (!Array.isArray(policies) || policies.length === 0) {
+    return res.status(400).json({ error: 'policies array is required' });
+  }
+  const { data, error } = await supabase
+    .from('break_policies')
+    .upsert(policies, { onConflict: 'name' })
+    .select();
+  if (error) return handleError(res, error);
+  invalidateBreakPolicyCache();
+  res.json(data);
+}
+
+// ─── fingerprint enrollment sync (unchanged) ───────────────────────────────
+
 export async function pendingSync(req, res) {
   const { device_id } = req.query;
   if (!device_id) return res.status(400).json({ error: 'device_id is required' });

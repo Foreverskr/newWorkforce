@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import {
-  Users, UserCheck, UserX, Clock, RefreshCw, Search,
+  Users, UserCheck, UserX, Clock, Search,
   TrendingUp, TrendingDown, Building2, Timer,
 } from 'lucide-react';
 import { api } from '../lib/api';
@@ -20,16 +20,58 @@ function toMinutes(t) {
 
 function minutesToClock(mins) {
   if (mins == null) return '—';
-  const total = Math.round(mins); // round once, on the combined value, so minutes never overflow to 60
+  const total = Math.round(mins);
   const h = Math.floor(total / 60) % 24;
   const m = total % 60;
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
 }
 
+// Format time for display (e.g., "8:07 PM")
+function formatClockTime(t) {
+  if (!t) return null;
+  const [h, m] = t.split(':').map(Number);
+  const d = new Date();
+  d.setHours(h, m, 0, 0);
+  return format(d, 'h:mm a');
+}
+
+// Groups a record's punches by break_type into { start, end } pairs
+function getBreakSegments(punches, labelByType = {}) {
+  if (!punches || punches.length === 0) return [];
+  
+  const byType = {};
+  for (const p of punches) {
+    if (!p.break_type) continue;
+    if (!byType[p.break_type]) {
+      byType[p.break_type] = { start: null, end: null };
+    }
+    if (p.punch_type === 'out') {
+      byType[p.break_type].start = p.punch_time;
+    } else if (p.punch_type === 'in') {
+      byType[p.break_type].end = p.punch_time;
+    }
+  }
+  
+  return Object.entries(byType)
+    .map(([type, seg]) => {
+      const rawLabel = labelByType[type] || type.charAt(0).toUpperCase() + type.slice(1);
+      const text = `${type} ${rawLabel}`.toLowerCase();
+      
+      let displayLabel = null;
+      if (text.includes('lunch')) displayLabel = 'Lunch Break';
+      else if (text.includes('coffee')) displayLabel = 'Coffee Break';
+      else if (text.includes('snack')) displayLabel = 'Snack Break';
+      
+      if (!displayLabel) return null;
+      
+      return { type, label: displayLabel, start: seg.start, end: seg.end };
+    })
+    .filter(Boolean);
+}
+
 const STATUS_FILTERS = ['all', 'present', 'late', 'absent'];
 
-// Animates a number counting up/down to its target whenever it changes —
-// makes refreshes feel alive instead of numbers just snapping in place.
+// Animates a number counting up/down to its target whenever it changes
 function useCountUp(target, duration = 500) {
   const [value, setValue] = useState(target);
   const fromRef = useState(() => ({ current: target }))[0];
@@ -42,7 +84,7 @@ function useCountUp(target, duration = 500) {
     let raf;
     const tick = (now) => {
       const t = Math.min(1, (now - start) / duration);
-      const eased = 1 - Math.pow(1 - t, 3); // ease-out cubic
+      const eased = 1 - Math.pow(1 - t, 3);
       setValue(Math.round(from + (to - from) * eased));
       if (t < 1) raf = requestAnimationFrame(tick);
       else fromRef.current = to;
@@ -55,45 +97,28 @@ function useCountUp(target, duration = 500) {
   return value;
 }
 
-// Ticks once a second so "Updated Xs ago" stays live without re-fetching.
-function useNow(intervalMs = 1000) {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), intervalMs);
-    return () => clearInterval(id);
-  }, [intervalMs]);
-  return now;
-}
-
-function timeAgo(date, now) {
-  if (!date) return null;
-  const secs = Math.max(0, Math.floor((now - date.getTime()) / 1000));
-  if (secs < 5) return 'just now';
-  if (secs < 60) return `${secs}s ago`;
-  const mins = Math.floor(secs / 60);
-  if (mins < 60) return `${mins}m ago`;
-  return format(date, 'HH:mm:ss');
-}
-
 export default function Dashboard() {
   const [today, setToday] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [lastUpdated, setLastUpdated] = useState(null);
-  const [autoRefresh, setAutoRefresh] = useState(false);
   const [statusFilter, setStatusFilter] = useState('all');
   const [query, setQuery] = useState('');
+  const [breakLabels, setBreakLabels] = useState({});
 
-  // Weekly trend is optional — only renders if your API exposes it.
-  // Add `getWeeklyTrend(days)` to lib/api returning
-  // [{ date: 'YYYY-MM-DD', present: n, late: n, absent: n, total: n }, ...]
+  // Weekly trend is optional
   const [weekly, setWeekly] = useState(null);
   const [weeklyError, setWeeklyError] = useState(false);
+
+  // Load break policies
+  useEffect(() => {
+    api.getBreakPolicies()
+      .then(policies => setBreakLabels(Object.fromEntries(policies.map(p => [p.name, p.label]))))
+      .catch(() => {});
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
       setToday(await api.getToday());
-      setLastUpdated(new Date());
     } catch (e) {
       console.error(e);
     } finally {
@@ -121,35 +146,24 @@ export default function Dashboard() {
 
   useEffect(() => { load(); loadWeekly(); }, [load, loadWeekly]);
 
+  // SSE real-time updates
   useEffect(() => {
     const source = new EventSource('/api/events');
     source.addEventListener('attendance:updated', () => {
       load();
       loadWeekly();
     });
-    return () => source.close();
+    return () => {
+      source.close();
+    };
   }, [load, loadWeekly]);
-
-  useEffect(() => {
-    if (!autoRefresh) return;
-    const id = setInterval(load, 30000);
-    return () => clearInterval(id);
-  }, [autoRefresh, load]);
-
-  const now = useNow(1000);
 
   const records = today?.records || [];
   const present = records.filter(r => r.status === 'present');
   const late = records.filter(r => r.status === 'late');
   const clockedOut = records.filter(r => r.clock_out);
 
-  const totalEmployees = today?.total_employees ?? 0; // whole-company headcount
-
-  // "Scheduled today" = employees who actually have a shift today. Records only
-  // ever contain scheduled employees, so records.length is the true denominator
-  // for attendance rate — NOT total_employees, which includes everyone on staff
-  // regardless of whether they're rostered today. Prefer an explicit API field
-  // if you add one (e.g. today.scheduled_count), falling back to records.length.
+  const totalEmployees = today?.total_employees ?? 0;
   const scheduledToday = today?.scheduled_count ?? today?.total_scheduled ?? records.length;
 
   const presentCount = present.length;
@@ -164,7 +178,7 @@ export default function Dashboard() {
     return mins.reduce((a, b) => a + b, 0) / mins.length;
   }, [present, late]);
 
-  // Department breakdown, built from today's actual records — no invented data.
+  // Department breakdown
   const deptBreakdown = useMemo(() => {
     const map = new Map();
     for (const r of records) {
@@ -191,14 +205,13 @@ export default function Dashboard() {
       .sort((a, b) => (toMinutes(a.clock_in) ?? 9999) - (toMinutes(b.clock_in) ?? 9999));
   }, [records, statusFilter, query]);
 
-  // Animated counters — numbers glide to their new value instead of snapping.
+  // Animated counters
   const totalEmployeesAnim = useCountUp(totalEmployees);
   const presentTotalAnim = useCountUp(presentTotal);
   const absentCountAnim = useCountUp(absentCount);
   const lateCountAnim = useCountUp(today?.late ?? 0);
 
-  // Auto-generated callout: surfaces whichever department most needs eyes on
-  // it right now, so the breakdown isn't just a static list to scan manually.
+  // Auto-generated insight
   const deptInsight = useMemo(() => {
     const withShifts = deptBreakdown.filter(d => d.total > 0);
     if (!withShifts.length) return null;
@@ -208,12 +221,10 @@ export default function Dashboard() {
       return rateA - rateB;
     })[0];
     const rate = Math.round(((worst.present + worst.late) / worst.total) * 100);
-    if (rate === 100) return null; // nothing to flag, everyone's in
+    if (rate === 100) return null;
     if (rate === 0) return { dept: worst.dept, text: `${worst.dept} has no one clocked in yet today (0 of ${worst.total}).`, severity: 'high' };
     return { dept: worst.dept, text: `${worst.dept} is lagging today — only ${rate}% clocked in.`, severity: rate < 50 ? 'high' : 'medium' };
   }, [deptBreakdown]);
-
-  const isLive = autoRefresh && !loading;
 
   if (loading && !today) return <div className="loading"><div className="spinner" /> Loading dashboard…</div>;
 
@@ -275,30 +286,22 @@ export default function Dashboard() {
           from { opacity: 0; transform: translateY(-4px); }
           to { opacity: 1; transform: translateY(0); }
         }
+        .break-entry {
+          font-size: 11px;
+          color: var(--text-dim);
+          display: flex;
+          flex-direction: column;
+          gap: 2px;
+        }
+        .break-entry span {
+          white-space: nowrap;
+        }
       `}</style>
+
       <div className="flex-between" style={{ marginBottom: 24, flexWrap: 'wrap', gap: 12 }}>
         <div>
           <h2 style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.5px' }}>Dashboard</h2>
           <p className="text-dim text-sm" style={{ marginTop: 4 }}>{format(new Date(), 'EEEE, MMMM d, yyyy')}</p>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          {lastUpdated && (
-            <span className="text-dim text-sm" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <span className={`live-dot ${isLive ? 'pulsing' : ''}`} />
-              Updated {timeAgo(lastUpdated, now)}
-            </span>
-          )}
-          <label className="text-dim text-sm" style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
-            <input
-              type="checkbox"
-              checked={autoRefresh}
-              onChange={e => setAutoRefresh(e.target.checked)}
-            />
-            Auto-refresh
-          </label>
-          <button className="btn btn-ghost" onClick={load} disabled={loading}>
-            <RefreshCw size={14} className={loading ? 'spin' : ''} /> Refresh
-          </button>
         </div>
       </div>
 
@@ -352,7 +355,7 @@ export default function Dashboard() {
       </div>
 
       <div className="grid-2" style={{ marginTop: 16 }}>
-        {/* Today's records */}
+        {/* Today's records with break information */}
         <div className="card">
           <div className="card-header" style={{ flexWrap: 'wrap', gap: 10 }}>
             <div>
@@ -390,23 +393,35 @@ export default function Dashboard() {
             </div>
           ) : (
             <div className="checkin-scroll" style={{ display: 'flex', flexDirection: 'column', gap: 10, maxHeight: 340, overflowY: 'auto' }}>
-              {filteredRecords.map(r => (
-                <div key={r.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 0', borderBottom: '1px solid var(--border-subtle)' }}>
-                  <div className="avatar" style={{ flexShrink: 0 }}>{initials(r.employees?.name)}</div>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.employees?.name}</div>
-                    <div className="text-dim text-sm" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.employees?.department}</div>
-                  </div>
-                  <div style={{ textAlign: 'right', flexShrink: 0 }}>
-                    <div className={`badge ${r.status}`}>
-                      <span className="badge-dot" />{r.status}
+              {filteredRecords.map(r => {
+                const breakSegments = getBreakSegments(r.punches, breakLabels);
+                return (
+                  <div key={r.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 0', borderBottom: '1px solid var(--border-subtle)' }}>
+                    <div className="avatar" style={{ flexShrink: 0 }}>{initials(r.employees?.name)}</div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.employees?.name}</div>
+                      <div className="text-dim text-sm" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.employees?.department}</div>
+                      {breakSegments.length > 0 && (
+                        <div className="break-entry" style={{ marginTop: 2 }}>
+                          {breakSegments.map(seg => (
+                            <span key={seg.type}>
+                              {seg.label}: {formatClockTime(seg.start) || '—'} → {seg.end ? formatClockTime(seg.end) : 'ongoing'}
+                            </span>
+                          ))}
+                        </div>
+                      )}
                     </div>
-                    <div className="mono text-dim" style={{ marginTop: 4, fontSize: 11, whiteSpace: 'nowrap' }}>
-                      {r.clock_in ? `${r.clock_in} ${r.clock_out ? `→ ${r.clock_out}` : '→ …'}` : 'Not clocked in'}
+                    <div style={{ textAlign: 'right', flexShrink: 0 }}>
+                      <div className={`badge ${r.status}`}>
+                        <span className="badge-dot" />{r.status}
+                      </div>
+                      <div className="mono text-dim" style={{ marginTop: 4, fontSize: 11, whiteSpace: 'nowrap' }}>
+                        {r.clock_in ? `${r.clock_in} ${r.clock_out ? `→ ${r.clock_out}` : '→ …'}` : 'Not clocked in'}
+                      </div>
                     </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
@@ -475,7 +490,7 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* Department breakdown — built entirely from today's real records */}
+      {/* Department breakdown */}
       {deptBreakdown.length > 0 && (
         <div className="card" style={{ marginTop: 16 }}>
           <div className="card-header">
@@ -520,7 +535,7 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* Weekly trend — only shows once api.getWeeklyTrend() is implemented server-side */}
+      {/* Weekly trend */}
       {weekly && weekly.length > 0 && (
         <div className="card" style={{ marginTop: 16 }}>
           <div className="card-title" style={{ marginBottom: 16 }}>Attendance Trend — Last {weekly.length} Days</div>

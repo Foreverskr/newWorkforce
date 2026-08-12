@@ -60,6 +60,44 @@ function normalizeImportTime(value) {
   return String(value).trim();
 }
 
+// Turns 12-hour-friendly "HH:MM:SS" into "h:mm a" for display (no timezone
+// conversion involved — these are already wall-clock punch times).
+function formatClockTime(t) {
+  if (!t) return null;
+  const [h, m] = t.split(':').map(Number);
+  const d = new Date();
+  d.setHours(h, m, 0, 0);
+  return format(d, 'h:mm a');
+}
+
+// Groups a record's punches by break_type into { start, end } pairs — the
+// 'out' punch for a break type is its start, the matching 'in' is its end.
+// A break with a start but no end yet means the employee is currently on it.
+function getBreakSegments(punches, labelByType = {}) {
+  if (!punches || punches.length === 0) return [];
+  const byType = {};
+  for (const p of punches) {
+    if (!p.break_type) continue;
+    byType[p.break_type] ||= { start: null, end: null };
+    if (p.punch_type === 'out') byType[p.break_type].start = p.punch_time;
+    if (p.punch_type === 'in') byType[p.break_type].end = p.punch_time;
+  }
+  return Object.entries(byType)
+    .map(([type, seg]) => {
+      const rawLabel = labelByType[type] || (type.charAt(0).toUpperCase() + type.slice(1));
+      const text = `${type} ${rawLabel}`.toLowerCase();
+      // Normalize to a plain "Lunch Break" / "Coffee Break" regardless of
+      // any "Morning"/"Afternoon" prefix on the underlying policy label.
+      // Break types that are neither (e.g. a Snack break) are dropped.
+      let label = null;
+      if (text.includes('lunch')) label = 'Lunch Break';
+      else if (text.includes('coffee')) label = 'Coffee Break';
+      if (!label) return null;
+      return { type, label, start: seg.start, end: seg.end };
+    })
+    .filter(Boolean);
+}
+
 function ManualModal({ employees, onClose, onSave }) {
   const [form, setForm] = useState({
     employee_id: '', date: toISODate(new Date()),
@@ -196,6 +234,7 @@ function ExportPasswordModal({ onClose, onConfirm }) {
 export default function AttendancePage({ onToast }) {
   const [records, setRecords] = useState([]);
   const [employees, setEmployees] = useState([]);
+  const [breakLabels, setBreakLabels] = useState({}); // { [break_type]: label }
   const [loading, setLoading] = useState(true);
   const [filters, setFilters] = useState({
     start_date: toISODate(new Date()),
@@ -211,6 +250,11 @@ export default function AttendancePage({ onToast }) {
   const fileInputRef = useRef(null);
 
   useEffect(() => { api.getEmployees().then(setEmployees); }, []);
+  useEffect(() => {
+    api.getBreakPolicies()
+      .then(policies => setBreakLabels(Object.fromEntries(policies.map(p => [p.name, p.label]))))
+      .catch(() => {}); // non-critical — falls back to capitalized break_type
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -361,6 +405,49 @@ export default function AttendancePage({ onToast }) {
     }
   };
 
+  // ONE-TIME FIX: collapses the break_policies table down to a single active
+  // Lunch Break and a single active Coffee Break, both 30 minutes. Any other
+  // policy in the same category (e.g. a duplicate "Morning Coffee Break")
+  // is deactivated, not deleted, so the change is reversible from the DB —
+  // but the break engine only ever reads active:true rows, so functionally
+  // it's gone. Remove this button once you've run it.
+  const [fixingBreaks, setFixingBreaks] = useState(false);
+  const handleFixBreakPolicies = async () => {
+    if (!confirm('This will keep only ONE Lunch Break and ONE Coffee Break policy (30 min each) and deactivate any duplicates. Continue?')) return;
+    setFixingBreaks(true);
+    try {
+      const policies = await api.getBreakPolicies();
+      const categorize = p => {
+        const text = `${p.name} ${p.label}`.toLowerCase();
+        if (text.includes('lunch')) return 'lunch';
+        if (text.includes('coffee')) return 'coffee';
+        return null;
+      };
+      const groups = { lunch: [], coffee: [] };
+      for (const p of policies) {
+        const cat = categorize(p);
+        if (cat) groups[cat].push(p);
+      }
+      if (groups.lunch.length === 0 && groups.coffee.length === 0) {
+        onToast('No Lunch/Coffee break policies found to fix', 'error');
+        return;
+      }
+      const updates = [];
+      for (const cat of ['lunch', 'coffee']) {
+        const sorted = [...groups[cat]].sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0));
+        sorted.forEach((p, i) => {
+          updates.push({ ...p, duration_minutes: 30, active: i === 0 });
+        });
+      }
+      await api.updateBreakPolicies(updates);
+      onToast('Fixed — one Lunch Break and one Coffee Break, 30 min each', 'success');
+    } catch (e) {
+      onToast(e.message || 'Failed to update break policies', 'error');
+    } finally {
+      setFixingBreaks(false);
+    }
+  };
+
   return (
     <div className="page">
       <div className="flex-between" style={{ marginBottom: 24 }}>
@@ -376,6 +463,9 @@ export default function AttendancePage({ onToast }) {
             style={{ display: 'none' }}
             onChange={handleImportFile}
           />
+          <button className="btn btn-ghost" onClick={handleFixBreakPolicies} disabled={fixingBreaks}>
+            {fixingBreaks ? 'Fixing…' : 'Fix Break Policies'}
+          </button>
           <button className="btn btn-ghost" onClick={() => fileInputRef.current?.click()} disabled={importing}>
             <Upload size={14} /> {importing ? 'Importing…' : 'Import'}
           </button>
@@ -448,6 +538,7 @@ export default function AttendancePage({ onToast }) {
                   <th>Date</th>
                   <th>Clock In</th>
                   <th>Clock Out</th>
+                  <th>Breaks</th>
                   <th>Hours</th>
                   <th>Status</th>
                   <th>Notes</th>
@@ -469,6 +560,23 @@ export default function AttendancePage({ onToast }) {
                     <td className="mono">{r.date}</td>
                     <td className="mono" style={{ color: 'var(--green)' }}>{r.clock_in || '—'}</td>
                     <td className="mono" style={{ color: 'var(--accent)' }}>{r.clock_out || '—'}</td>
+                    <td className="text-sm">
+                      {(() => {
+                        const segments = getBreakSegments(r.punches, breakLabels);
+                        if (segments.length === 0) return '—';
+                        return (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                            {segments.map(seg => (
+                              <span key={seg.type} className="mono">
+                                {seg.label}: {formatClockTime(seg.start) || '—'}
+                                {' – '}
+                                {seg.end ? formatClockTime(seg.end) : 'ongoing'}
+                              </span>
+                            ))}
+                          </div>
+                        );
+                      })()}
+                    </td>
                     <td className="mono">{r.hours_worked ? `${r.hours_worked}h` : '—'}</td>
                     <td>
                       <span className={`badge ${r.status}`}>

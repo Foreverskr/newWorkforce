@@ -89,34 +89,10 @@ export async function getSchedule(req, res) {
   res.json(result);
 }
 
-// 🟢 ONE-DRIVER-PER-SHIFT GUARD: the TNVS fleet has exactly one morning driver
-// and one night driver — no capacity matrix needed for Drivers.
-async function checkDriverShiftCapacity({ shift_template_id, date, employee_id }) {
-  const { data: existingAssignments, error: countErr } = await supabase
-    .from('shift_assignments')
-    .select('id, employee_id, employees:employee_id(name)')
-    .eq('role_id', shift_template_id)
-    .eq('date', date)
-    .eq('is_day_off', false)
-    .neq('employee_id', employee_id);
-  if (countErr) return { error: countErr };
-
-  const occupied = (existingAssignments || [])[0];
-  if (occupied) {
-    const occupantName = occupied.employees?.name || 'another driver';
-    return {
-      blocked: `This shift on ${date} is already assigned to ${occupantName}. Only one driver can occupy each shift — remove that assignment first, or assign the reserve driver instead.`
-    };
-  }
-
-  return { ok: true };
-}
-
-// 🟢 STAFFING GUARD (non-driver positions): a staffing_requirements row must
-// exist matching this employee's position for this shift_template_id + date,
-// and it must not already be full. This is the general position-coverage
-// model still used by Cashier, Sales, etc. — Drivers use the simpler
-// one-per-shift rule above instead (see checkAssignmentCapacity below).
+// 🟢 STAFFING GUARD: a staffing_requirements row must exist matching this
+// employee's position for this shift_template_id + date, and it must not
+// already be full. This applies to every position, including Driver — a
+// shift/date with no requirement defined is blocked, not silently approved.
 async function checkStaffingCapacity({ shift_template_id, date, employeePosition, employee_id }) {
   const { data: requirements, error: reqErr } = await supabase
     .from('staffing_requirements')
@@ -159,11 +135,10 @@ async function checkStaffingCapacity({ shift_template_id, date, employeePosition
   return { ok: true };
 }
 
-// Dispatch to the right capacity rule for this employee's position.
+// Dispatch to the capacity rule. Every position — including Driver — is
+// governed by the staffing_requirements model, so a shift/date without a
+// matching requirement is blocked rather than approved.
 async function checkAssignmentCapacity({ shift_template_id, date, employeePosition, employee_id }) {
-  if (employeePosition?.toLowerCase() === 'driver') {
-    return checkDriverShiftCapacity({ shift_template_id, date, employee_id });
-  }
   return checkStaffingCapacity({ shift_template_id, date, employeePosition, employee_id });
 }
 
@@ -305,40 +280,12 @@ export async function createRecurring(req, res) {
     }
   }
 
-  // 🟢 CAPACITY GUARD: batched across usableDates. Drivers use the simple
-  // one-per-shift rule; every other position uses the staffing_requirements
-  // capacity model, same as the single-assignment path above.
+  // 🟢 CAPACITY GUARD: batched across usableDates. Every position — including
+  // Driver — requires a matching staffing_requirements row for the given
+  // shift_template_id + date; dates with no matching requirement are skipped
+  // rather than approved.
   let staffingSkipped = [];
-  if (!dayOff && employeePosition?.toLowerCase() === 'driver') {
-    const { data: existingAssignments, error: countErr } = await supabase
-      .from('shift_assignments')
-      .select('employee_id, date')
-      .eq('role_id', shift_template_id)
-      .eq('is_day_off', false)
-      .in('date', usableDates)
-      .neq('employee_id', employee_id);
-    if (countErr) return handleError(res, countErr);
-
-    const occupiedDates = new Set((existingAssignments || []).map(a => a.date));
-
-    const stillUsable = [];
-    for (const d of usableDates) {
-      if (occupiedDates.has(d)) {
-        staffingSkipped.push({ date: d, reason: 'Shift already occupied by another driver' });
-        continue;
-      }
-      stillUsable.push(d);
-    }
-    usableDates = stillUsable;
-
-    if (usableDates.length === 0) {
-      return res.status(400).json({
-        error: `No dates available — this shift is already assigned to another driver on every matching date.`,
-        skipped_leave: skipped,
-        skipped_staffing: staffingSkipped,
-      });
-    }
-  } else if (!dayOff) {
+  if (!dayOff) {
     const { data: requirements, error: reqErr } = await supabase
       .from('staffing_requirements')
       .select('id, position_id, required_count, date')
@@ -388,6 +335,7 @@ export async function createRecurring(req, res) {
       }
       stillUsable.push(d);
     }
+
     usableDates = stillUsable;
 
     if (usableDates.length === 0) {

@@ -10,6 +10,10 @@ const FINGERPRINT_SLOTS = [
 
 const PAGE_SIZES = [10, 25, 50, 100];
 
+// Matches FINGER_WAIT_TIMEOUT_MS on the ESP32 (60s) — purely cosmetic here,
+// just lets us show a countdown so "capturing" doesn't feel indefinite.
+const ENROLL_TIMEOUT_SECONDS = 60;
+
 function EmployeeModal({ emp, onClose, onSave }) {
   const [form, setForm] = useState({
     name: '', email: '', employee_id: '', department: '',
@@ -88,8 +92,56 @@ function EmployeeModal({ emp, onClose, onSave }) {
   );
 }
 
+// Ticks up once a second while a request is active, purely for the
+// "Xs elapsed" / timeout-countdown display below.
+function useElapsedSeconds(active) {
+  const [seconds, setSeconds] = useState(0);
+  useEffect(() => {
+    if (!active) { setSeconds(0); return; }
+    setSeconds(0);
+    const id = setInterval(() => setSeconds(s => s + 1), 1000);
+    return () => clearInterval(id);
+  }, [active]);
+  return seconds;
+}
+
+// The big highlighted panel shown while a scan is pending/in-progress —
+// replaces the old single line of text next to a Cancel button. Loud
+// enough to notice from across the room, since the person doing the
+// enrolling is standing at the kiosk, not looking at this screen.
+function ScanningPanel({ request, onCancel }) {
+  const isCapturing = request.status === 'capturing';
+  const elapsed = useElapsedSeconds(true);
+  const remaining = Math.max(0, ENROLL_TIMEOUT_SECONDS - elapsed);
+
+  return (
+    <div className="scan-panel">
+      <div className="scan-icon-wrap">
+        <span className="scan-ring" />
+        <span className="scan-ring delay" />
+        <Fingerprint size={28} className="scan-icon" />
+      </div>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontWeight: 700, fontSize: 14 }}>
+          {isCapturing ? 'Scan the finger on the terminal' : 'Waiting for the terminal to pick up the job…'}
+        </div>
+        <div className="text-dim text-sm" style={{ marginTop: 2 }}>
+          {isCapturing
+            ? `Scanning on ${request.device_id} — hold still, you'll be asked to scan twice`
+            : 'This will start automatically once a device polls for work'}
+        </div>
+        <div className="text-dim text-sm" style={{ marginTop: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
+          <Loader2 size={12} className="spin" />
+          {isCapturing ? `Times out in ${remaining}s` : `${elapsed}s elapsed`}
+        </div>
+      </div>
+      <button className="btn btn-ghost btn-sm" onClick={onCancel}>Cancel</button>
+    </div>
+  );
+}
+
 // Polls a pending enrollment request until the ESP32 terminal reports back
-function FingerprintSlotRow({ employeeId, slot, onChanged, onToast }) {
+function FingerprintSlotRow({ employeeId, slot, onChanged, onToast, anyActive, onActiveChange }) {
   const [request, setRequest] = useState(slot.request);
   const pollRef = useRef(null);
 
@@ -97,8 +149,19 @@ function FingerprintSlotRow({ employeeId, slot, onChanged, onToast }) {
     setRequest(slot.request);
   }, [slot.request]);
 
+  const isActive = !!request && ['pending', 'capturing'].includes(request.status);
+
+  // Let the parent modal know whether THIS slot currently has an active
+  // scan, so it can grey out "Enroll" on the other slots — only one
+  // physical scan can happen on the device at a time.
   useEffect(() => {
-    if (!request || !['pending', 'capturing'].includes(request.status)) {
+    onActiveChange(slot.slot_label, isActive);
+    return () => onActiveChange(slot.slot_label, false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isActive]);
+
+  useEffect(() => {
+    if (!isActive) {
       clearInterval(pollRef.current);
       return;
     }
@@ -142,12 +205,17 @@ function FingerprintSlotRow({ employeeId, slot, onChanged, onToast }) {
     } catch (e) { onToast(e.message, 'error'); }
   };
 
+  if (isActive) {
+    return (
+      <div style={{ padding: '10px 0', borderBottom: '1px solid var(--border, #e5e7eb)' }}>
+        <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 8 }}>{slot.title}</div>
+        <ScanningPanel request={request} onCancel={cancel} />
+      </div>
+    );
+  }
+
   let status;
-  if (request?.status === 'pending') {
-    status = <span className="text-dim text-sm flex-center" style={{ gap: 6 }}><Loader2 size={13} className="spin" /> Waiting for terminal…</span>;
-  } else if (request?.status === 'capturing') {
-    status = <span className="text-dim text-sm flex-center" style={{ gap: 6 }}><Loader2 size={13} className="spin" /> Scanning on {request.device_id}…</span>;
-  } else if (slot.fingerprint) {
+  if (slot.fingerprint) {
     status = (
       <span className="text-sm flex-center" style={{ gap: 6, color: 'var(--success, #16a34a)' }}>
         <CheckCircle2 size={14} /> Enrolled on {slot.fingerprint.device_id}
@@ -157,6 +225,10 @@ function FingerprintSlotRow({ employeeId, slot, onChanged, onToast }) {
     status = <span className="text-dim text-sm">Not enrolled</span>;
   }
 
+  // Another slot on this employee is mid-scan — block starting a second
+  // one, since the physical device can only run one job at a time.
+  const disabledByOther = anyActive && !isActive;
+
   return (
     <div className="flex-between" style={{ padding: '10px 0', borderBottom: '1px solid var(--border, #e5e7eb)' }}>
       <div>
@@ -164,15 +236,20 @@ function FingerprintSlotRow({ employeeId, slot, onChanged, onToast }) {
         {status}
       </div>
       <div className="flex-center gap-2">
-        {request && ['pending', 'capturing'].includes(request.status) ? (
-          <button className="btn btn-ghost btn-sm" onClick={cancel}>Cancel</button>
-        ) : slot.fingerprint ? (
+        {slot.fingerprint ? (
           <>
-            <button className="btn btn-ghost btn-sm" onClick={startEnroll}>Re-scan</button>
-            <button className="btn btn-danger btn-sm" onClick={remove}>Remove</button>
+            <button className="btn btn-ghost btn-sm" onClick={startEnroll} disabled={disabledByOther}>Re-scan</button>
+            <button className="btn btn-danger btn-sm" onClick={remove} disabled={disabledByOther}>Remove</button>
           </>
         ) : (
-          <button className="btn btn-primary btn-sm" onClick={startEnroll}>Enroll</button>
+          <button
+            className="btn btn-primary btn-sm"
+            onClick={startEnroll}
+            disabled={disabledByOther}
+            title={disabledByOther ? 'Finish the scan in progress first' : undefined}
+          >
+            Enroll
+          </button>
         )}
       </div>
     </div>
@@ -182,6 +259,7 @@ function FingerprintSlotRow({ employeeId, slot, onChanged, onToast }) {
 function FingerprintModal({ emp, onClose, onToast }) {
   const [slots, setSlots] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [activeSlots, setActiveSlots] = useState({}); // slot_label -> bool
 
   const load = async () => {
     try {
@@ -193,9 +271,56 @@ function FingerprintModal({ emp, onClose, onToast }) {
 
   useEffect(() => { load(); }, []);
 
+  const handleActiveChange = (slotLabel, isActive) => {
+    setActiveSlots(prev => {
+      if (!!prev[slotLabel] === isActive) return prev;
+      return { ...prev, [slotLabel]: isActive };
+    });
+  };
+
+  const anyActive = Object.values(activeSlots).some(Boolean);
+
   return (
     <div className="modal-overlay">
       <div className="modal">
+        <style>{`
+          .scan-panel {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            padding: 14px;
+            border-radius: 10px;
+            background: var(--surface2, rgba(59, 130, 246, 0.08));
+            border: 1px solid var(--accent, #3b82f6);
+          }
+          .scan-icon-wrap {
+            position: relative;
+            width: 48px;
+            height: 48px;
+            flex-shrink: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+          }
+          .scan-icon {
+            color: var(--accent, #3b82f6);
+            position: relative;
+            z-index: 1;
+          }
+          .scan-ring {
+            position: absolute;
+            inset: 0;
+            border-radius: 50%;
+            border: 2px solid var(--accent, #3b82f6);
+            opacity: 0;
+            animation: scanPulse 1.8s ease-out infinite;
+          }
+          .scan-ring.delay { animation-delay: 0.6s; }
+          @keyframes scanPulse {
+            0% { transform: scale(0.55); opacity: 0.55; }
+            100% { transform: scale(1.35); opacity: 0; }
+          }
+        `}</style>
         <div className="modal-header">
           <span className="modal-title flex-center" style={{ gap: 8 }}>
             <Fingerprint size={18} /> {emp.name} — Fingerprints
@@ -216,6 +341,8 @@ function FingerprintModal({ emp, onClose, onToast }) {
                 slot={slot}
                 onChanged={load}
                 onToast={onToast}
+                anyActive={anyActive}
+                onActiveChange={handleActiveChange}
               />
             ))
           )}

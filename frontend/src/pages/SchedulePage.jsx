@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { Calendar, Plus, Trash2, Clock, AlertTriangle, Truck, Users, UserCheck, Search, Sun, Moon, ChevronLeft, ChevronRight, ChevronDown } from 'lucide-react';
 import { api } from '../lib/api';
 
@@ -61,6 +61,15 @@ function shiftIcon(name = '') {
 }
 
 const WEEKDAY_SHORT = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+// A leave record covers either a single `date` field, or a `start_date`/`end_date`
+// range, depending on how it comes back from /leaves — handle both shapes so this
+// doesn't silently stop matching if the API changes which one it sends.
+function leaveCoversDate(leave, date) {
+  if (leave.date) return leave.date === date;
+  if (leave.start_date && leave.end_date) return date >= leave.start_date && date <= leave.end_date;
+  return false;
+}
 
 // ─── Sub-Components ─────────────────────────────────────────────────────────────
 function ShiftTemplateModal({ templates, onClose, onSave, onDelete, onToast }) {
@@ -350,7 +359,18 @@ function DriverAvailabilityPanel({ onToast }) {
 }
 
 // ─── Requirements Matrix (compact, one row per shift type) ─────────────────────
-function RequirementsMatrix({ positionName, rows, dates, onCellClick, onDeleteRow }) {
+// `highlightedCell` is a `${shiftTemplateId}-${date}` key set by the "N short-staffed"
+// jump action below — when it matches a cell in THIS matrix, we scroll to it and give
+// it a temporary glow so it's obvious which slot was meant, even after switching tabs.
+function RequirementsMatrix({ positionName, rows, dates, onCellClick, onDeleteRow, highlightedCell }) {
+  const cellRefs = useRef({});
+
+  useEffect(() => {
+    if (!highlightedCell) return;
+    const el = cellRefs.current[highlightedCell];
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, [highlightedCell, rows]);
+
   return (
     <div style={{ marginBottom: 20 }}>
       <div className="text-dim text-sm" style={{ marginBottom: 8, fontWeight: 600 }}>{positionName} requirements this week</div>
@@ -382,6 +402,8 @@ function RequirementsMatrix({ positionName, rows, dates, onCellClick, onDeleteRo
                   </td>
                   {dates.map(date => {
                     const cell = row.cells[date];
+                    const cellKey = `${row.id}-${date}`;
+                    const isHighlighted = cellKey === highlightedCell;
                     if (!cell) {
                       return (
                         <td key={date} style={{ textAlign: 'center', padding: 0 }}>
@@ -398,12 +420,15 @@ function RequirementsMatrix({ positionName, rows, dates, onCellClick, onDeleteRo
                     return (
                       <td key={date} style={{ textAlign: 'center', padding: 0 }}>
                         <button
+                          ref={el => { if (el) cellRefs.current[cellKey] = el; }}
                           onClick={() => onCellClick(cell)}
                           title={`${cell.assigned_count}/${cell.required_count} filled — click to edit or remove`}
                           style={{
                             width: '100%', minWidth: 56, padding: '6px 4px', borderRadius: 6, border: 'none', cursor: 'pointer', fontSize: '0.8rem', fontWeight: 600,
                             background: full ? 'rgba(16,185,129,0.15)' : 'rgba(239,68,68,0.15)',
                             color: full ? 'var(--green, #10b981)' : 'var(--danger, #ef4444)',
+                            boxShadow: isHighlighted ? '0 0 0 3px var(--accent, #3b82f6)' : undefined,
+                            transition: 'box-shadow 0.2s ease',
                           }}
                         >{cell.assigned_count}/{cell.required_count}</button>
                       </td>
@@ -431,7 +456,11 @@ function RequirementsMatrix({ positionName, rows, dates, onCellClick, onDeleteRo
 }
 
 // ─── Employee schedule list (compact, single position) ─────────────────────────
-function EmployeeScheduleGroup({ position, employees, dates, assignmentMap, onRemove }) {
+// Cell priority: approved leave > rest day > shift > empty. Leave wins even over an
+// existing rest-day/shift assignment for that date, since it reflects what's actually
+// going to happen — the underlying assignment record is left alone (Leaves page owns
+// approving/revoking it), this just changes what's displayed.
+function EmployeeScheduleGroup({ position, employees, dates, assignmentMap, leaveMap, onRemove }) {
   const scheduledCount = employees.filter(e => dates.some(date => assignmentMap[date]?.[e.id])).length;
   return (
     <div>
@@ -462,10 +491,19 @@ function EmployeeScheduleGroup({ position, employees, dates, assignmentMap, onRe
                   </div>
                 </td>
                 {dates.map(date => {
+                  const leave = leaveMap[date]?.[emp.id];
                   const a = assignmentMap[date]?.[emp.id];
                   return (
                     <td key={date} style={{ textAlign: 'center', padding: '4px' }}>
-                      {!a ? (
+                      {leave ? (
+                        <span
+                          className="badge"
+                          style={{ fontSize: '0.68rem', padding: '3px 6px', background: 'rgba(139,92,246,0.18)', color: '#8b5cf6', fontWeight: 700, cursor: 'default' }}
+                          title={`On leave${leave.leave_type || leave.type ? ` — ${leave.leave_type || leave.type}` : ''}${leave.reason || leave.notes ? `: ${leave.reason || leave.notes}` : ''}`}
+                        >
+                          Leave
+                        </span>
+                      ) : !a ? (
                         <span style={{ color: 'var(--text-muted)' }}>—</span>
                       ) : a.is_day_off ? (
                         <span className="badge inactive" style={{ fontSize: '0.68rem', padding: '3px 6px', cursor: 'pointer' }} onClick={() => onRemove(a)} title="Click to remove">Rest</span>
@@ -572,6 +610,7 @@ export default function SchedulePage({ onToast }) {
   const [positions, setPositions] = useState([]);
   const [assignments, setAssignments] = useState([]);
   const [coverage, setCoverage] = useState([]);
+  const [leaves, setLeaves] = useState([]);
   const [totals, setTotals] = useState({ total_required: 0, total_assigned: 0, understaffed_slots: 0 });
   const [loading, setLoading] = useState(true);
   const [showTemplates, setShowTemplates] = useState(false);
@@ -590,6 +629,11 @@ export default function SchedulePage({ onToast }) {
   const [showScheduled, setShowScheduled] = useState(false);
   const [showNoShifts, setShowNoShifts] = useState(false);
 
+  // "N short-staffed" jump target — `${shiftTemplateId}-${date}`, cleared a couple
+  // seconds after it's shown so the glow in RequirementsMatrix doesn't linger forever.
+  const [highlightedCell, setHighlightedCell] = useState(null);
+  const [understaffedCursor, setUnderstaffedCursor] = useState(0);
+
   const [range, setRange] = useState(() => {
     const start = startOfWeek(new Date());
     const end = new Date(start);
@@ -600,12 +644,13 @@ export default function SchedulePage({ onToast }) {
   const load = async () => {
     setLoading(true);
     try {
-      const [emps, tmpls, positionsList, sched, cov] = await Promise.all([
+      const [emps, tmpls, positionsList, sched, cov, leavesData] = await Promise.all([
         api.getEmployees(),
         api.getShiftTemplates(),
         api.getPositions(),
         api.getSchedule({ start_date: range.start, end_date: range.end }),
         api.getCoverage({ start_date: range.start, end_date: range.end }),
+        api.getLeaves({ start_date: range.start, end_date: range.end, status: 'approved' }),
       ]);
       setEmployees(emps);
       setTemplates(tmpls);
@@ -613,6 +658,7 @@ export default function SchedulePage({ onToast }) {
       setAssignments(sched);
       setCoverage(cov.coverage);
       setTotals(cov.totals);
+      setLeaves(leavesData);
     } catch (e) { onToast(e.message, 'error'); }
     finally { setLoading(false); }
   };
@@ -626,6 +672,13 @@ export default function SchedulePage({ onToast }) {
     });
     return () => source.close();
   }, [range.start, range.end]);
+
+  // Auto-clear the short-staffed highlight after a couple seconds
+  useEffect(() => {
+    if (!highlightedCell) return;
+    const t = setTimeout(() => setHighlightedCell(null), 2500);
+    return () => clearTimeout(t);
+  }, [highlightedCell]);
 
   const saveTemplate = async (id, form) => {
     if (id) { const updated = await api.updateShiftTemplate(id, form); setTemplates(ts => ts.map(t => t.id === id ? updated : t)); }
@@ -676,6 +729,23 @@ export default function SchedulePage({ onToast }) {
     assignments.forEach(a => { if (!map[a.date]) map[a.date] = {}; map[a.date][a.employee_id] = a; });
     return map;
   }, [assignments]);
+
+  // date -> employee_id -> leave record, for every approved leave that overlaps
+  // this date. Rebuilt whenever the leave list or visible date range changes.
+  const leaveMap = useMemo(() => {
+    const map = {};
+    leaves
+      .filter(l => !l.status || l.status.toLowerCase() === 'approved')
+      .forEach(l => {
+        datesInRange.forEach(date => {
+          if (leaveCoversDate(l, date)) {
+            if (!map[date]) map[date] = {};
+            map[date][l.employee_id] = l;
+          }
+        });
+      });
+    return map;
+  }, [leaves, datesInRange]);
 
   const activeEmployees = useMemo(() => employees.filter(e => e.status === 'active'), [employees]);
 
@@ -812,6 +882,24 @@ export default function SchedulePage({ onToast }) {
 
   const currentPositionId = activePositions.find(p => p.name === selectedPosition)?.id || activePositions[0]?.id || '';
 
+  // Every coverage cell that isn't fully staffed, oldest date first. Clicking the
+  // "N short-staffed" indicator switches to that cell's position tab (if needed) and
+  // highlights it; clicking again cycles to the next one so all of them are reachable.
+  const understaffedList = useMemo(
+    () => coverage.filter(c => c.status !== 'full').sort((a, b) => a.date.localeCompare(b.date)),
+    [coverage]
+  );
+
+  const jumpToShortStaffed = () => {
+    if (understaffedList.length === 0) return;
+    const idx = understaffedCursor % understaffedList.length;
+    const target = understaffedList[idx];
+    setUnderstaffedCursor(idx + 1);
+    setHighlightedCell(`${target.shift_template_id}-${target.date}`);
+    const posName = target.positions?.name || 'Unassigned';
+    if (posName !== selectedPosition) setSelectedPosition(posName);
+  };
+
   return (
     <div className="page">
       {/* Header — title + subtitle only. Primary actions live in the panel toolbar below,
@@ -837,7 +925,15 @@ export default function SchedulePage({ onToast }) {
           <div className="flex-center gap-2" style={{ flexWrap: 'wrap' }}>
             <span className="text-dim text-sm">{totals.total_assigned} of {totals.total_required} slots filled</span>
             {totals.understaffed_slots > 0 && (
-              <span className="flex-center" style={{ gap: 6, color: 'var(--danger, #ef4444)' }}><AlertTriangle size={14} /> {totals.understaffed_slots} short-staffed</span>
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                onClick={jumpToShortStaffed}
+                title="Click to jump to a short-staffed slot"
+                style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--danger, #ef4444)' }}
+              >
+                <AlertTriangle size={14} /> {totals.understaffed_slots} short-staffed
+              </button>
             )}
             <span style={{ width: 1, height: 20, background: 'var(--border)', margin: '0 2px' }} />
             <button className="btn btn-ghost btn-sm" onClick={() => setShowTemplates(true)}><Clock size={13} /> Manage Templates</button>
@@ -880,6 +976,7 @@ export default function SchedulePage({ onToast }) {
                 dates={datesInRange}
                 onCellClick={openReqModal}
                 onDeleteRow={deleteRequirementRow}
+                highlightedCell={highlightedCell}
               />
             )}
 
@@ -923,6 +1020,7 @@ export default function SchedulePage({ onToast }) {
                   employees={positionEmployees}
                   dates={datesInRange}
                   assignmentMap={assignmentMap}
+                  leaveMap={leaveMap}
                   onRemove={removeAssignment}
                 />
               )}

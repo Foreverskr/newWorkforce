@@ -21,6 +21,7 @@ import fingerprintsRoutes from './routes/fingerprints.routes.js';
 import deviceRoutes from './routes/device.routes.js';
 import eventsRoutes from './routes/events.routes.js';
 import './jobs/reconcileAttendanceCron.js';
+import { scheduleAutoClockOut } from './jobs/autoClockOut.job.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -49,7 +50,7 @@ app.use('/api/drivers', requireAuth, driversRoutes);
 app.use('/api/analytics', requireAuth, analyticsRoutes);
 app.use('/api/positions', requireAuth, positionsRoutes); // <-- Added requireAuth
 app.use('/api/staffing-requirements', requireAuth, staffingRequirementsRoutes); // <-- I also added 
-
+scheduleAutoClockOut();
 
 app.use(notFoundHandler);
 app.use(errorHandler);
