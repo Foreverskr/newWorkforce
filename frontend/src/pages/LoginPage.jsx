@@ -1,6 +1,8 @@
 import { useState } from 'react';
-import { LogIn } from 'lucide-react';
+import { ArrowRight, Lock, User } from 'lucide-react';
 import { saveSession } from '../utils/session.js';
+import loginBg from '../../picture/login_bg.png';
+import tripwiseIcon from '../../picture/tripwise_icon.png';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:3001';
 
@@ -9,7 +11,10 @@ export default function LoginPage({ onLogin }) {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
-  const set = k => e => setForm(f => ({ ...f, [k]: e.target.value }));
+  const set = k => e => {
+    setError('');
+    setForm(f => ({ ...f, [k]: e.target.value }));
+  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -43,64 +48,88 @@ export default function LoginPage({ onLogin }) {
   };
 
   return (
-    <div style={{
-      minHeight: '100vh',
-      background: 'var(--bg)',
-      display: 'flex',
-      alignItems: 'center',
-      justifyContent: 'center',
-    }}>
-      <div className="card" style={{ width: '100%', maxWidth: 400, padding: 36 }}>
-        <div style={{ textAlign: 'center', marginBottom: 32 }}>
-          <h1 style={{ fontSize: 24, fontWeight: 700 }}>
-            Attend<span style={{ color: 'var(--accent)' }}>Track</span>
-          </h1>
-          <p className="text-dim text-sm" style={{ marginTop: 6 }}>Sign in to continue</p>
+    <div className="login-shell">
+      <section
+        className="login-hero"
+        style={{ backgroundImage: `url(${loginBg})` }}
+        aria-label="TripWise operations dashboard"
+      >
+        <div className="login-hero-overlay" />
+        <div className="login-brand">
+          <img src={tripwiseIcon} alt="" />
+          <span>TripWise.</span>
         </div>
 
-        <form onSubmit={handleSubmit}>
-          <div className="form-group" style={{ marginBottom: 16 }}>
-            <label>Username</label>
-            <input
-              type="text"
-              value={form.username}
-              onChange={set('username')}
-              placeholder="admin"
-              autoFocus
-            />
+        <div className="login-hero-copy">
+          <h1>
+            Total Control.
+            <span> One Dashboard.</span>
+          </h1>
+          <p>
+            Monitor attendance, workforce, logistics, and operations across all
+            integrated subsystems from a single secure portal.
+          </p>
+        </div>
+      </section>
+
+      <section className="login-panel">
+        <div className="login-form-wrap">
+          <div className="login-heading">
+            <h2>Welcome back</h2>
+            <p>Sign in to your account</p>
           </div>
 
-          <div className="form-group" style={{ marginBottom: 24 }}>
-            <label>Password</label>
-            <input
-              type="password"
-              value={form.password}
-              onChange={set('password')}
-              placeholder="••••••••"
-            />
-          </div>
-
-          {error && (
-            <div style={{
-              background: 'var(--red-bg)', color: 'var(--red)',
-              borderRadius: 'var(--radius-sm)', padding: '10px 14px',
-              fontSize: 13, marginBottom: 16,
-            }}>
-              {error}
+          <form onSubmit={handleSubmit} className="login-form" autoComplete="off">
+            <div className="login-field">
+              <label>Username</label>
+              <div className="login-input-wrap">
+                <User size={15} />
+                <input
+                  type="text"
+                  value={form.username}
+                  onChange={set('username')}
+                  placeholder="admin"
+                  autoComplete="off"
+                  autoFocus
+                />
+              </div>
             </div>
-          )}
 
-          <button
-            type="submit"
-            className="btn btn-primary w-full"
-            style={{ justifyContent: 'center', padding: '11px 0' }}
-            disabled={loading || !form.username || !form.password}
-          >
-            <LogIn size={15} />
-            {loading ? 'Signing in…' : 'Sign In'}
-          </button>
-        </form>
-      </div>
+            <div className="login-field">
+              <label>Password</label>
+              <div className="login-input-wrap">
+                <Lock size={15} />
+                <input
+                  type="password"
+                  value={form.password}
+                  onChange={set('password')}
+                  placeholder="••••••••"
+                  autoComplete="new-password"
+                />
+              </div>
+            </div>
+
+            {error && (
+              <div className="login-error">
+                {error}
+              </div>
+            )}
+
+            <button
+              type="submit"
+              className="login-submit"
+              disabled={loading || !form.username || !form.password}
+            >
+              {loading ? 'Signing in...' : 'Login'}
+              <ArrowRight size={15} />
+            </button>
+          </form>
+        </div>
+
+        <footer className="login-footer">
+          <span>© 2026 TripWise. All rights reserved.</span>
+        </footer>
+      </section>
     </div>
   );
 }

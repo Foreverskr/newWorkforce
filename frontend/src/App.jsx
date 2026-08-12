@@ -1,4 +1,4 @@
-import { Routes, Route, useLocation } from "react-router-dom";
+import { Routes, Route, useLocation, useNavigate } from "react-router-dom";
 import { useState, useEffect, useCallback, useRef } from "react";
 import { LogOut, Menu, Moon, Settings, Sun, User } from "lucide-react";
 import Sidebar from "./components/Sidebar.jsx";
@@ -25,8 +25,10 @@ function AppContent() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const profileMenuRef = useRef(null);
+  const didOpenDashboardRef = useRef(false);
   const { theme, toggleTheme } = useTheme();
   const location = useLocation();
+  const navigate = useNavigate();
 
   const [isLoggedIn, setIsLoggedIn] = useState(() => {
     const session = getSession();
@@ -67,6 +69,12 @@ function AppContent() {
     return () =>
       window.removeEventListener("session-expired", onSessionExpired);
   }, [handleLogout]);
+
+  useEffect(() => {
+    if (!isLoggedIn || didOpenDashboardRef.current) return;
+    didOpenDashboardRef.current = true;
+    navigate("/", { replace: true });
+  }, [isLoggedIn, navigate]);
 
   useEffect(() => {
     const onPointerDown = (event) => {

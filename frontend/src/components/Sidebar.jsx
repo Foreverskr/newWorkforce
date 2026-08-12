@@ -6,15 +6,18 @@ import {
 import { format } from 'date-fns';
 import tripwiseLogo from '../../picture/tripwise_icon.png';
 
-const navItems = [
-  { to: '/',           label: 'Dashboard',        icon: LayoutDashboard },
-  { to: '/clock',      label: 'Clock In / Out',   icon: Clock           },
-  { to: '/attendance', label: 'Timesheet Management',        icon: Calendar        },
-  { to: '/employees',  label: 'Status & Biometrics Management',         icon: Users           },
-  { to: '/schedule',  label: 'Shift & Schedule Management',         icon: Calendar           },
-  { to: '/leaves',     label: 'Leave Management',  icon: FileText        },
-  { to: '/drivers',    label: 'Drivers',           icon: Users           },
-  { to: '/analytics',  label: 'Analytics',         icon: BarChart2       },
+const mainNavItems = [
+  { to: '/', label: 'Dashboard', icon: LayoutDashboard },
+];
+
+const managementNavItems = [
+  { to: '/clock',      label: 'Clock In / Out',   icon: Clock    },
+  { to: '/attendance', label: 'Timesheet Management', icon: Calendar },
+  { to: '/employees',  label: 'Status & Biometrics Management', icon: Users },
+  { to: '/schedule',   label: 'Shift & Schedule Management', icon: Calendar },
+  { to: '/leaves',     label: 'Leave Management', icon: FileText },
+  { to: '/drivers',    label: 'Drivers',          icon: Users    },
+  { to: '/analytics',  label: 'Analytics',        icon: BarChart2 },
 ];
 
 export default function Sidebar() {
@@ -39,7 +42,20 @@ export default function Sidebar() {
 
       <nav className="sidebar-nav">
         <span className="nav-section-label">Main</span>
-        {navItems.map(({ to, label, icon: Icon }) => (
+        {mainNavItems.map(({ to, label, icon: Icon }) => (
+          <NavLink
+            key={to}
+            to={to}
+            end={to === '/'}
+            className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}
+          >
+            <Icon size={16} />
+            {label}
+          </NavLink>
+        ))}
+
+        <span className="nav-section-label">Management</span>
+        {managementNavItems.map(({ to, label, icon: Icon }) => (
           <NavLink
             key={to}
             to={to}

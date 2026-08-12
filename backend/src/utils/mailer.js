@@ -55,7 +55,7 @@ function renderEmailLayout({
         <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="background:#ffffff; border-radius:8px; overflow:hidden; max-width:600px;">
           <tr>
             <td style="background:${accentColor}; padding:20px 32px;">
-              <span style="font-size:20px; font-weight:bold; color:#ffffff;">AttendTrack</span>
+              <span style="font-size:20px; font-weight:bold; color:#ffffff;">TripWise</span>
               <div style="font-size:12px; color:#e5e7eb; margin-top:2px;">Workforce Management</div>
             </td>
           </tr>
@@ -68,8 +68,8 @@ function renderEmailLayout({
           </tr>
           <tr>
             <td style="padding:20px 32px; background:#f9fafb; border-top:1px solid #e5e7eb;">
-              <div style="font-size:12px; color:#9ca3af;">This is an automated notification from the AttendTrack Workforce Management System.</div>
-              <div style="font-size:12px; color:#9ca3af; margin-top:4px;">© ${new Date().getFullYear()} AttendTrack. All rights reserved.</div>
+              <div style="font-size:12px; color:#9ca3af;">This is an automated notification from the TripWise Workforce Management System.</div>
+              <div style="font-size:12px; color:#9ca3af; margin-top:4px;">© ${new Date().getFullYear()} TripWise. All rights reserved.</div>
             </td>
           </tr>
         </table>
