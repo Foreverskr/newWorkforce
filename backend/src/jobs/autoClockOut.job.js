@@ -10,12 +10,21 @@
 import cron from 'node-cron';
 import { supabase } from '../config/supabase.js';
 import { broadcastSseEvent } from '../utils/sse.js';
-import { getBreakPolicies, getNextAction, creditedBreakMinutes } from '../services/breakEngine.js';
+import { getBreakPolicies, getNextAction, creditedBreakMinutes, minutesElapsedAcrossMidnight } from '../services/breakEngine.js';
 import { todayDateString } from '../controllers/attendance.controller.js';
 
 function timeToMinutes(t) {
   const [h, m] = t.split(':').map(Number);
   return h * 60 + m;
+}
+
+// Pure calendar-date arithmetic on the "YYYY-MM-DD" string itself — no
+// timezone lookup needed here since we're just stepping the same date
+// value back by one day, not asking "what day is it right now somewhere".
+function previousDateString(dateStr) {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() - 1);
+  return d.toISOString().slice(0, 10);
 }
 
 async function getShiftForEmployee(employee_id, date) {
@@ -30,12 +39,23 @@ async function getShiftForEmployee(employee_id, date) {
 
 export async function runAutoClockOut() {
   const today = todayDateString();
+  const yesterday = previousDateString(today);
   const nowMinutes = timeToMinutes(new Date().toTimeString().slice(0, 5));
 
+  // IMPORTANT: an overnight shift (e.g. 18:00 -> 03:00) is clocked in on
+  // one calendar date but its attendance row only becomes eligible for
+  // auto-clock-out AFTER midnight, once "today" has already rolled over
+  // to the next date. Filtering strictly to `date = today` would make
+  // that still-open row invisible forever the moment midnight passes —
+  // this job would never be able to close it out. Pulling both `today`
+  // and `yesterday` covers a still-open row regardless of which side of
+  // midnight we're currently on; the shift-end comparison below (which
+  // already handles the day rollover per-employee) decides whether it's
+  // actually time to close each one.
   const { data: openAttendance, error } = await supabase
     .from('attendance')
-    .select('id, employee_id, date')
-    .eq('date', today)
+    .select('id, employee_id, date, clock_in')
+    .in('date', [yesterday, today])
     .eq('is_finalized', false)
     .not('clock_in', 'is', null);
 
@@ -49,12 +69,36 @@ export async function runAutoClockOut() {
 
   for (const att of openAttendance) {
     try {
-      const todaysShift = await getShiftForEmployee(att.employee_id, today);
+      // Look up the shift assigned for the date the employee actually
+      // clocked in on (att.date) — NOT the outer `today` — since a
+      // yesterday-dated row was scheduled against yesterday's shift
+      // assignment, not today's.
+      const todaysShift = await getShiftForEmployee(att.employee_id, att.date);
       const shiftEnd = todaysShift?.shift_templates?.end_time;
       if (!shiftEnd) continue; // no assigned shift end on record — nothing to auto-close against
 
-      const shiftEndMinutes = timeToMinutes(shiftEnd.slice(0, 5));
-      if (nowMinutes < shiftEndMinutes) continue; // shift hasn't ended yet
+      // Overnight-safe "has the shift ended?" check. Plain
+      // `nowMinutes < shiftEndMinutes` breaks for any shift crossing
+      // midnight (e.g. 19:00 → 03:00): at 13:23 this afternoon,
+      // 03:00 looks numerically "in the past" even though the shift's
+      // real end is tomorrow's 3am, not today's — which was causing
+      // employees to get force-clocked-out mid-afternoon with a negative
+      // duration. Anchor everything to the employee's actual clock-in
+      // time so "now" and "shift end" are compared on the same timeline.
+      const clockInMinutes = timeToMinutes(att.clock_in.slice(0, 5));
+      let shiftEndMinutes = timeToMinutes(shiftEnd.slice(0, 5));
+      const isOvernight = shiftEndMinutes <= clockInMinutes;
+      if (isOvernight) shiftEndMinutes += 24 * 60;
+
+      // If att.date is yesterday relative to `today`, the wall-clock
+      // "now" has already crossed one midnight relative to their
+      // clock-in, on top of whatever the shift's own overnight rollover
+      // adds. Add that day back in so effectiveNowMinutes and
+      // shiftEndMinutes stay on the same timeline.
+      let effectiveNowMinutes = nowMinutes + (att.date === yesterday ? 24 * 60 : 0);
+      if (isOvernight && effectiveNowMinutes < clockInMinutes) effectiveNowMinutes += 24 * 60;
+
+      if (effectiveNowMinutes < shiftEndMinutes) continue; // shift hasn't ended yet
 
       const shiftEndTime = shiftEnd.length === 5 ? `${shiftEnd}:00` : shiftEnd;
 
@@ -108,7 +152,7 @@ export async function runAutoClockOut() {
       punches = [...punches, finalPunch];
 
       const firstIn = punches[0];
-      const grossMinutes = timeToMinutes(shiftEndTime.slice(0, 5)) - timeToMinutes(firstIn.punch_time.slice(0, 5));
+      const grossMinutes = minutesElapsedAcrossMidnight(firstIn.punch_time, shiftEndTime);
       const credited = creditedBreakMinutes(punches, policies);
       const netMinutes = grossMinutes - credited;
 
@@ -134,7 +178,7 @@ export async function runAutoClockOut() {
         timestamp: new Date().toISOString(),
       });
 
-      console.log(`[autoClockOut] finalized attendance ${att.id} for employee ${att.employee_id} at ${shiftEndTime}`);
+      console.log(`[autoClockOut] finalized attendance ${att.id} (date ${att.date}) for employee ${att.employee_id} at ${shiftEndTime}`);
     } catch (err) {
       console.error(`[autoClockOut] failed for attendance ${att.id}`, err);
       // continue to the next employee — one failure shouldn't block the batch

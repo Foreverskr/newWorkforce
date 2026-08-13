@@ -31,6 +31,33 @@ export function invalidateBreakPolicyCache() {
 }
 
 /**
+ * Minutes elapsed from `startTime` to `endTime` (both "HH:MM" or
+ * "HH:MM:SS" strings), correctly handling shifts that cross midnight.
+ *
+ * Plain `timeToMinutes(end) - timeToMinutes(start)` silently goes
+ * negative whenever `end`'s clock-time-of-day is numerically smaller than
+ * `start`'s — which is exactly what happens for any overnight shift
+ * (e.g. 19:00 → 03:00). This treats an end time that's "earlier in the
+ * day" than the start as having rolled over to the next calendar day,
+ * and adds 24h before diffing so the result is always the real elapsed
+ * duration, never negative.
+ *
+ * NOTE: this is a time-of-day heuristic, not a true datetime diff — it
+ * assumes the gap between start and end never exceeds ~24h, which holds
+ * for any single work shift.
+ */
+export function minutesElapsedAcrossMidnight(startTime, endTime) {
+  const toMinutes = t => {
+    const [h, m] = t.split(':').map(Number);
+    return h * 60 + m;
+  };
+  const startMinutes = toMinutes(startTime.slice(0, 5));
+  let endMinutes = toMinutes(endTime.slice(0, 5));
+  if (endMinutes <= startMinutes) endMinutes += 24 * 60; // rolled over midnight
+  return endMinutes - startMinutes;
+}
+
+/**
  * Given the punches recorded so far (sorted by sequence) and the active
  * break policy list, decide what the NEXT punch means.
  *

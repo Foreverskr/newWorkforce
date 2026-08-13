@@ -7,6 +7,7 @@ import {
   getNextAction,
   creditedBreakMinutes,
   invalidateBreakPolicyCache,
+  minutesElapsedAcrossMidnight,
 } from '../services/breakEngine.js';
 
 export function todayDateString(timeZone = 'Asia/Manila') {
@@ -31,7 +32,7 @@ function timeToMinutes(t) {
 //      not a new step, and just echoes back the current state.
 // Note: the lock is in-process only — fine for a single kiosk backend
 // instance, but won't coordinate across multiple server processes.
-const DEBOUNCE_SECONDS = 5 ; // 5 minutes (was 4s) — testing a longer duplicate-scan window
+const DEBOUNCE_SECONDS = 5; // 5 minutes (was 4s) — testing a longer duplicate-scan window
 const employeeLocks = new Map();
 
 function withEmployeeLock(employee_id, fn) {
@@ -47,6 +48,88 @@ function secondsBetween(t1, t2) {
     return h * 3600 + m * 60 + (s || 0);
   };
   return Math.abs(toSeconds(t1) - toSeconds(t2));
+}
+
+// ─── break time tracking helpers ────────────────────────────────────────────
+
+// `attendance` only has fixed columns for these two breaks. break_policies
+// is admin-editable free text, so its `name` can drift away from these
+// column names (that drift is exactly what caused the
+// "Could not find the 'coffee_morning_end' column" error). Keep this map as
+// the single source of truth for which break types have a home in
+// `attendance`, and treat anything else as "log the punch, skip the summary
+// column" instead of crashing clock-out.
+const BREAK_COLUMN_MAP = {
+  lunch: ['lunch_start', 'lunch_end'],
+  coffee: ['coffee_start', 'coffee_end'],
+};
+
+/**
+ * Extract break start/end times from punches and return as an object
+ * keyed by real `attendance` column names (e.g. lunch_start, coffee_end).
+ * Break types with no entry in BREAK_COLUMN_MAP are skipped with a warning
+ * instead of producing an update payload Supabase will reject.
+ */
+function getBreakTimesFromPunches(punches) {
+  const breakTimes = {};
+
+  if (!punches || punches.length === 0) return breakTimes;
+
+  // Find matching pairs of break OUT and IN punches
+  for (let i = 0; i < punches.length - 1; i++) {
+    const punch = punches[i];
+    if (punch.punch_type === 'out' && punch.break_type && !punch.is_final) {
+      // Look for matching IN punch for this break
+      for (let j = i + 1; j < punches.length; j++) {
+        const nextPunch = punches[j];
+        if (nextPunch.punch_type === 'in' && nextPunch.break_type === punch.break_type && !nextPunch.is_final) {
+          // Found matching pair
+          const cols = BREAK_COLUMN_MAP[punch.break_type];
+          if (cols) {
+            const [startCol, endCol] = cols;
+            breakTimes[startCol] = punch.punch_time;
+            breakTimes[endCol] = nextPunch.punch_time;
+          } else {
+            console.warn(
+              `[getBreakTimesFromPunches] Unknown break_type "${punch.break_type}" — ` +
+              `no matching attendance columns, skipping summary write for this break. ` +
+              `(Check break_policies.name matches one of: ${Object.keys(BREAK_COLUMN_MAP).join(', ')})`
+            );
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  return breakTimes;
+}
+
+// ─── manual/admin hour calculation helper ──────────────────────────────────
+
+// Used by create() and bulkImport() to compute hours_worked from raw
+// clock_in/clock_out time strings typed or imported by an admin.
+//
+// The previous implementation built two `Date` objects on the SAME `date`
+// (`new Date(`${date}T${clock_in}`)` / `...T${clock_out}`) and subtracted
+// them directly. That's fine for a same-day shift, but for any shift that
+// crosses midnight (e.g. 6PM–3AM) it produces a NEGATIVE duration, because
+// 3:00 AM is numerically earlier in the day than 6:00 PM even though it's
+// really ~9 hours later, on the next calendar day. minutesElapsedAcrossMidnight
+// already solves exactly this for the kiosk/auto-clock-out paths — reuse it
+// here instead of re-deriving the same logic with Date math.
+//
+// Returns null (rather than throwing) if either time string is missing or
+// malformed, so a bad row just gets hours_worked: null instead of crashing
+// the whole create/import call.
+function computeHoursWorked(clockIn, clockOut) {
+  if (!clockIn || !clockOut) return null;
+  try {
+    const grossMinutes = minutesElapsedAcrossMidnight(clockIn, clockOut);
+    return parseFloat((grossMinutes / 60).toFixed(2));
+  } catch {
+    return null;
+  }
 }
 
 // ─── shared helpers ─────────────────────────────────────────────────────────
@@ -247,9 +330,16 @@ async function recordPunchLocked({ employee_id, date, punchTime, validateAction 
   if (action.is_final) {
     // Final OUT → close out the day's summary numbers.
     const firstIn = allPunches[0];
-    const grossMinutes = timeToMinutes(punchTime.slice(0, 5)) - timeToMinutes(firstIn.punch_time.slice(0, 5));
+    // Overnight-safe: a shift that runs past midnight (e.g. 19:00 → 03:00)
+    // would otherwise produce a negative duration here, since punchTime's
+    // clock-time-of-day is numerically smaller than firstIn's.
+    const grossMinutes = minutesElapsedAcrossMidnight(firstIn.punch_time, punchTime);
     const credited = creditedBreakMinutes(allPunches, policies);
     const netMinutes = grossMinutes - credited;
+
+    // Get all break times from punches (only for known break types —
+    // see BREAK_COLUMN_MAP above)
+    const breakTimes = getBreakTimesFromPunches(allPunches);
 
     const { data: updated, error: updateError } = await supabase
       .from('attendance')
@@ -261,6 +351,7 @@ async function recordPunchLocked({ employee_id, date, punchTime, validateAction 
         is_finalized: true,
         auto_clock_out: isAutomatic,
         updated_at: new Date().toISOString(),
+        ...breakTimes, // Spread break times into update
       })
       .eq('id', attendanceRow.id)
       .select()
@@ -269,11 +360,17 @@ async function recordPunchLocked({ employee_id, date, punchTime, validateAction 
     attendanceRow = updated;
   } else if (action.punch_type === 'in' && action.break_type) {
     // A break just ended — keep break_minutes current for the live dashboard
-    // even before the final clock-out happens.
+    // and update the specific break end time column
     const creditedSoFar = creditedBreakMinutes(allPunches, policies);
+    const breakTimes = getBreakTimesFromPunches(allPunches);
+
     const { data: updated, error: updateError } = await supabase
       .from('attendance')
-      .update({ break_minutes: creditedSoFar, updated_at: new Date().toISOString() })
+      .update({
+        break_minutes: creditedSoFar,
+        updated_at: new Date().toISOString(),
+        ...breakTimes, // Spread break times into update
+      })
       .eq('id', attendanceRow.id)
       .select()
       .single();
@@ -511,24 +608,26 @@ export async function breakEnd(req, res) {
   }
 }
 
-// ─── admin: manual create / bulk import / delete (unchanged in spirit) ────
+// ─── admin: manual create / bulk import / delete ────────────────────────────
 
 export async function create(req, res) {
-  const { employee_id, date, clock_in, clock_out, status, notes } = req.body;
+  const { employee_id, date, clock_in, clock_out, status, notes, lunch_start, lunch_end, coffee_start, coffee_end } = req.body;
   if (!employee_id || !date) return res.status(400).json({ error: 'employee_id and date required' });
 
-  let hoursWorked = null;
-  if (clock_in && clock_out) {
-    const ci = new Date(`${date}T${clock_in}`);
-    const co = new Date(`${date}T${clock_out}`);
-    hoursWorked = parseFloat(((co - ci) / 3600000).toFixed(2));
-  }
+  // Overnight-safe: see computeHoursWorked() above. A plain same-day Date
+  // diff previously went negative for any shift crossing midnight
+  // (e.g. clock_in 18:00, clock_out 03:00 -> was producing -11.03h).
+  const hoursWorked = computeHoursWorked(clock_in, clock_out);
 
   const { data, error } = await supabase
     .from('attendance')
     .upsert([{
       employee_id, date, clock_in, clock_out, status: status || 'present', notes,
       hours_worked: hoursWorked, is_finalized: !!clock_out,
+      lunch_start: lunch_start || null,
+      lunch_end: lunch_end || null,
+      coffee_start: coffee_start || null,
+      coffee_end: coffee_end || null,
     }], { onConflict: 'employee_id,date' })
     .select()
     .single();
@@ -559,12 +658,8 @@ export async function bulkImport(req, res) {
   }
 
   const rows = records.map(r => {
-    let hoursWorked = null;
-    if (r.clock_in && r.clock_out) {
-      const ci = new Date(`${r.date}T${r.clock_in}`);
-      const co = new Date(`${r.date}T${r.clock_out}`);
-      if (!isNaN(ci) && !isNaN(co)) hoursWorked = parseFloat(((co - ci) / 3600000).toFixed(2));
-    }
+    // Overnight-safe: see computeHoursWorked() above.
+    const hoursWorked = computeHoursWorked(r.clock_in, r.clock_out);
     return {
       employee_id: r.employee_id,
       date: r.date,
@@ -574,6 +669,10 @@ export async function bulkImport(req, res) {
       notes: r.notes || null,
       hours_worked: hoursWorked,
       is_finalized: !!r.clock_out,
+      lunch_start: r.lunch_start || null,
+      lunch_end: r.lunch_end || null,
+      coffee_start: r.coffee_start || null,
+      coffee_end: r.coffee_end || null,
     };
   });
 
@@ -606,7 +705,7 @@ export async function bulkImport(req, res) {
   res.status(201).json({ imported: data.length, records: result });
 }
 
-// ─── PASSWORD-PROTECTED EXCEL EXPORT (unchanged) ───────────────────────────
+// ─── PASSWORD-PROTECTED EXCEL EXPORT ───────────────────────────────────────
 
 export async function exportExcel(req, res) {
   const { rows, password, filename } = req.body;
@@ -666,11 +765,28 @@ export async function remove(req, res) {
 // each configured break, then a final OUT once all breaks are used.
 
 export async function punch(req, res) {
-  const { employee_id } = req.body;
+  const { employee_id, client_timestamp } = req.body;
   if (!employee_id) return res.status(400).json({ error: 'employee_id is required' });
 
-  const today = todayDateString();
-  const punchTime = new Date().toTimeString().slice(0, 8);
+  let today = todayDateString();
+  let punchTime = new Date().toTimeString().slice(0, 8);
+
+  // Offline-queued punches replayed by the kiosk carry the REAL scan time
+  // in client_timestamp ("YYYY-MM-DD HH:MM:SS" — see punchTimestampNow()
+  // in the firmware). Previously this field was received but never read,
+  // so every offline punch got stamped with whatever time the sync call
+  // happened to land at, instead of the time the person actually scanned.
+  // If the device's clock hadn't synced with NTP yet, client_timestamp
+  // will instead be an "UNSYNCED-uptime-<seconds>s" string with no space
+  // in it — that fails the split check below and safely falls through to
+  // using "now", same as before.
+  if (client_timestamp) {
+    const [datePart, timePart] = client_timestamp.split(' ');
+    if (datePart && timePart) {
+      today = datePart;
+      punchTime = timePart.length === 5 ? `${timePart}:00` : timePart;
+    }
+  }
 
   try {
     const { attendance, punches, action, duplicate } = await recordPunch({ employee_id, date: today, punchTime });
@@ -710,6 +826,18 @@ export async function updateBreakPolicyConfig(req, res) {
   if (!Array.isArray(policies) || policies.length === 0) {
     return res.status(400).json({ error: 'policies array is required' });
   }
+
+  // Guard rail: `name` must map to a real attendance column (see
+  // BREAK_COLUMN_MAP above) or clock-out will fail with a schema-cache
+  // error the next time this break is used. Reject the save early instead.
+  const badNames = policies.map(p => p.name).filter(name => !BREAK_COLUMN_MAP[name]);
+  if (badNames.length > 0) {
+    return res.status(400).json({
+      error: `Invalid break policy name(s): ${badNames.join(', ')}. ` +
+        `Allowed names: ${Object.keys(BREAK_COLUMN_MAP).join(', ')}.`,
+    });
+  }
+
   const { data, error } = await supabase
     .from('break_policies')
     .upsert(policies, { onConflict: 'name' })
@@ -719,7 +847,7 @@ export async function updateBreakPolicyConfig(req, res) {
   res.json(data);
 }
 
-// ─── fingerprint enrollment sync (unchanged) ───────────────────────────────
+// ─── fingerprint enrollment sync ───────────────────────────────────────────
 
 export async function pendingSync(req, res) {
   const { device_id } = req.query;
