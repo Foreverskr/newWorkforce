@@ -1,5 +1,7 @@
+import { randomUUID } from 'crypto';
 import { supabase } from '../config/supabase.js';
 import { handleError } from '../middleware/errorHandler.js';
+import { broadcastSseEvent } from '../utils/sse.js';
 
 export function todayDateString(timeZone = 'Asia/Manila') {
   return new Intl.DateTimeFormat('en-CA', { timeZone }).format(new Date());
@@ -65,10 +67,10 @@ export async function getSchedule(req, res) {
 
   const { data, error } = await query;
   if (error) return handleError(res, error);
-  
+
   // 🟢 GHOST BUSTER: Filter out any rows with invalid/null employee_id BEFORE fetching names
   const validData = data.filter(a => a.employee_id && a.employee_id !== 'undefined' && a.employee_id !== 'null' && a.employee_id.trim() !== '');
-  
+
   // 🟢 Fetch employee names separately (Expecting the ID stored in shift_assignments to be employees.id)
   const employeeIds = [...new Set(validData.map(a => a.employee_id))];
   let empMap = {};
@@ -218,6 +220,9 @@ export async function createAssignment(req, res) {
     .select(ASSIGNMENT_SELECT)
     .single();
   if (error) return handleError(res, error);
+
+  broadcastSseEvent('schedule:updated', { type: 'assign', date, record: data, timestamp: new Date().toISOString() });
+
   res.status(201).json(data);
 }
 
@@ -362,12 +367,18 @@ export async function createRecurring(req, res) {
     .upsert(records, { onConflict: 'employee_id,date' })
     .select(ASSIGNMENT_SELECT);
   if (error) return handleError(res, error);
+
+  broadcastSseEvent('schedule:updated', { type: 'assign-recurring', dates: usableDates, count: data.length, timestamp: new Date().toISOString() });
+
   res.status(201).json({ created: data.length, skipped, skipped_staffing: staffingSkipped, assignments: data });
 }
 
 export async function deleteAssignment(req, res) {
   const { error } = await supabase.from('shift_assignments').delete().eq('id', req.params.id);
   if (error) return handleError(res, error);
+
+  broadcastSseEvent('schedule:updated', { type: 'delete', assignment_id: req.params.id, timestamp: new Date().toISOString() });
+
   res.json({ message: 'Shift assignment removed' });
 }
 
@@ -579,7 +590,7 @@ export async function revalidateDriverCoverage(date = getManilaNow().date) {
   const invalidated = [];
   for (const coverage of activeCoverage || []) {
     const replacement = byId[coverage.replacement_employee_id];
-    
+
     // Use can_cover_without_coverage, NOT can_cover, here.
     // can_cover is false whenever `covering` includes this employee — and
     // `covering` is built from this exact active coverage row, so a reserve
@@ -594,19 +605,19 @@ export async function revalidateDriverCoverage(date = getManilaNow().date) {
     const reason = (replacement?.availability_reason && replacement.availability_reason !== 'Already covering another driver' && replacement.availability_reason !== 'Covering another driver')
       ? replacement.availability_reason
       : 'Replacement is no longer eligible to work';
-    
+
     const { data, error: updateError } = await supabase
       .from('employee_reassignments')
-      .update({ 
-        status: 'invalid', 
-        invalid_reason: reason, 
-        invalidated_at: new Date().toISOString() 
+      .update({
+        status: 'invalid',
+        invalid_reason: reason,
+        invalidated_at: new Date().toISOString()
       })
       .eq('id', coverage.id)
       .eq('status', 'active')
       .select('id')
       .maybeSingle();
-    
+
     if (updateError) throw updateError;
     if (data) invalidated.push({ coverage_id: data.id, reason });
   }
@@ -729,7 +740,7 @@ export async function reassignDriver(req, res) {
   const originalState = roster.find(driver => driver.id === original_employee_id);
   const replacementState = roster.find(driver => driver.id === replacement_employee_id);
   if (!originalState) return res.status(404).json({ error: 'Original employee is not an active Driver role record' });
-  
+
   if (replacementState?.driver_role !== 'reserve') {
     return res.status(400).json({ error: 'Only the Reserve Driver (Available Anytime) can cover another driver\'s shift.' });
   }
@@ -774,7 +785,7 @@ export async function reassignDriver(req, res) {
     .maybeSingle();
 
   if (replacementAlreadyCovering) {
-    return res.status(409).json({ 
+    return res.status(409).json({
       error: `${replacementState?.name || 'This driver'} is already covering ${replacementAlreadyCovering.original?.name || 'another driver'} on ${date}. One driver cannot cover multiple shifts at the same time.`,
       already_covering: replacementAlreadyCovering
     });
@@ -804,4 +815,269 @@ export async function deleteReassignment(req, res) {
   const { error } = await supabase.from('employee_reassignments').delete().eq('id', req.params.id);
   if (error) return handleError(res, error);
   res.json({ message: 'Reassignment removed' });
+}
+
+// ── Schedule change proposals (hr_staff proposes → hr_manager approves) ──
+
+export async function proposeAssignment(req, res) {
+  const { employee_id, shift_template_id, date, notes, is_day_off } = req.body;
+  const dayOff = !!is_day_off;
+
+  if (!employee_id || !date || (!dayOff && !shift_template_id)) {
+    return res.status(400).json({ error: 'employee_id, date, and (shift_template_id or is_day_off) are required' });
+  }
+
+  let employeePosition = null;
+  if (!dayOff) {
+    const { data: empData } = await supabase.from('employees').select('position').eq('id', employee_id).single();
+    employeePosition = empData?.position || null;
+    if (!employeePosition) {
+      return res.status(400).json({ error: 'Cannot propose shift. Employee has no Position set.' });
+    }
+  }
+
+  const { data, error } = await supabase
+    .from('shift_assignment_proposals')
+    .insert([{
+      employee_id,
+      role_id: dayOff ? null : shift_template_id,
+      position: dayOff ? null : employeePosition,
+      date,
+      notes,
+      is_day_off: dayOff,
+      status: 'pending',
+      proposed_by: req.admin.id,
+    }])
+    .select('*, employees(name, employee_id), shift_templates:roles(name, start_time, end_time, color)')
+    .single();
+  if (error) return handleError(res, error);
+
+  broadcastSseEvent('schedule:updated', { type: 'proposal-created', date, record: data, timestamp: new Date().toISOString() });
+
+  res.status(201).json(data);
+}
+
+export async function getPendingProposals(req, res) {
+  const { data, error } = await supabase
+    .from('shift_assignment_proposals')
+    .select('*, employees(name, employee_id, position), shift_templates:roles(name, start_time, end_time, color), proposer:proposed_by(username)')
+    .eq('status', 'pending')
+    .order('created_at', { ascending: false });
+  if (error) return handleError(res, error);
+  res.json(data);
+}
+
+export async function proposeRecurringAssignment(req, res) {
+  const { employee_id, shift_template_id, start_date, end_date, days_of_week, notes, is_day_off } = req.body;
+  const dayOff = !!is_day_off;
+  if (!employee_id || !start_date || !end_date || !Array.isArray(days_of_week) || days_of_week.length === 0 || (!dayOff && !shift_template_id)) {
+    return res.status(400).json({ error: 'employee_id, start_date, end_date, days_of_week[], and (shift_template_id or is_day_off) are required' });
+  }
+
+  const dowSet = new Set(days_of_week.map(Number));
+  const dates = [];
+  const cur = new Date(start_date);
+  const end = new Date(end_date);
+  while (cur <= end) {
+    if (dowSet.has(cur.getDay())) dates.push(cur.toISOString().split('T')[0]);
+    cur.setDate(cur.getDate() + 1);
+  }
+  if (dates.length === 0) {
+    return res.status(400).json({ error: 'No matching dates found for the given days_of_week in that range' });
+  }
+
+  let employeePosition = null;
+  if (!dayOff) {
+    const { data: empData } = await supabase.from('employees').select('position').eq('id', employee_id).single();
+    employeePosition = empData?.position || null;
+    if (!employeePosition) {
+      return res.status(400).json({ error: 'Cannot propose recurring shift. Employee has no Position set.' });
+    }
+  }
+
+  // Leave/capacity aren't re-checked here — the same range can be pending for
+  // days before it's reviewed, and conditions (positions filled, leave
+  // approved) can change in the meantime. Each date is re-validated for real
+  // at approval time, same as a single-day proposal.
+  const batch_id = randomUUID();
+  const records = dates.map(date => ({
+    employee_id,
+    role_id: dayOff ? null : shift_template_id,
+    position: dayOff ? null : employeePosition,
+    date,
+    notes: notes || null,
+    is_day_off: dayOff,
+    status: 'pending',
+    proposed_by: req.admin.id,
+    batch_id,
+  }));
+
+  const { data, error } = await supabase
+    .from('shift_assignment_proposals')
+    .insert(records)
+    .select('*, employees(name, employee_id), shift_templates:roles(name, start_time, end_time, color)');
+  if (error) return handleError(res, error);
+
+  broadcastSseEvent('schedule:updated', { type: 'proposal-created-recurring', batch_id, count: data.length, timestamp: new Date().toISOString() });
+
+  res.status(201).json({ created: data.length, batch_id, proposals: data });
+}
+
+// Runs the same leave/capacity checks and live upsert createAssignment/approveProposal
+// use, for one pending proposal row. Returns { ok, assignment } or { ok: false, reason }.
+async function approveOneProposal(proposal) {
+  if (!proposal.is_day_off) {
+    const { data: conflict } = await supabase
+      .from('leaves')
+      .select('id, type, start_date, end_date, employees(name)')
+      .eq('employee_id', proposal.employee_id)
+      .eq('status', 'approved')
+      .lte('start_date', proposal.date)
+      .gte('end_date', proposal.date)
+      .maybeSingle();
+    if (conflict) {
+      const empName = conflict.employees?.name || 'This employee';
+      return { ok: false, reason: `${empName} is on approved ${conflict.type} leave from ${conflict.start_date} to ${conflict.end_date} — cannot approve a working shift on ${proposal.date}.` };
+    }
+
+    const { error: capacityErr, blocked } = await checkAssignmentCapacity({
+      shift_template_id: proposal.role_id,
+      date: proposal.date,
+      employeePosition: proposal.position,
+      employee_id: proposal.employee_id,
+    });
+    if (capacityErr) return { ok: false, reason: capacityErr.message || 'Capacity check failed' };
+    if (blocked) return { ok: false, reason: blocked };
+  }
+
+  const { data: liveAssignment, error: writeErr } = await supabase
+    .from('shift_assignments')
+    .upsert([{
+      employee_id: proposal.employee_id,
+      role_id: proposal.role_id,
+      position: proposal.position,
+      date: proposal.date,
+      notes: proposal.notes,
+      is_day_off: proposal.is_day_off,
+      updated_at: new Date().toISOString(),
+    }], { onConflict: 'employee_id,date' })
+    .select(ASSIGNMENT_SELECT)
+    .single();
+  if (writeErr) return { ok: false, reason: writeErr.message || 'Failed to write assignment' };
+
+  broadcastSseEvent('schedule:updated', { type: 'proposal-approved', date: proposal.date, record: liveAssignment, timestamp: new Date().toISOString() });
+
+  return { ok: true, assignment: liveAssignment };
+}
+
+export async function approveProposal(req, res) {
+  const { data: proposal, error: fetchErr } = await supabase
+    .from('shift_assignment_proposals')
+    .select('*')
+    .eq('id', req.params.id)
+    .eq('status', 'pending')
+    .single();
+  if (fetchErr || !proposal) return res.status(404).json({ error: 'Pending proposal not found' });
+
+  // A proposer can't approve their own proposal, even with approve rights —
+  // publishing still needs a second person to sign off.
+  if (proposal.proposed_by === req.admin.id) {
+    return res.status(403).json({ error: "You can't approve your own proposal — ask another manager or an admin to review it." });
+  }
+
+  const result = await approveOneProposal(proposal);
+  if (!result.ok) return res.status(409).json({ error: result.reason });
+
+  await supabase
+    .from('shift_assignment_proposals')
+    .update({ status: 'approved', reviewed_by: req.admin.id, reviewed_at: new Date().toISOString() })
+    .eq('id', proposal.id);
+
+  res.json({ message: 'Proposal approved and applied to schedule', assignment: result.assignment });
+}
+
+export async function rejectProposal(req, res) {
+  const { reason } = req.body;
+  const { data: proposal, error: fetchErr } = await supabase
+    .from('shift_assignment_proposals')
+    .select('id, proposed_by')
+    .eq('id', req.params.id)
+    .eq('status', 'pending')
+    .single();
+  if (fetchErr || !proposal) return res.status(404).json({ error: 'Pending proposal not found' });
+  if (proposal.proposed_by === req.admin.id) {
+    return res.status(403).json({ error: "You can't reject your own proposal — ask another manager or an admin to review it." });
+  }
+
+  const { data, error } = await supabase
+    .from('shift_assignment_proposals')
+    .update({ status: 'rejected', reviewed_by: req.admin.id, reviewed_at: new Date().toISOString(), rejection_reason: reason || null })
+    .eq('id', req.params.id)
+    .eq('status', 'pending')
+    .select()
+    .single();
+  if (error) return handleError(res, error);
+  if (!data) return res.status(404).json({ error: 'Pending proposal not found' });
+
+  broadcastSseEvent('schedule:updated', { type: 'proposal-rejected', proposal_id: req.params.id, timestamp: new Date().toISOString() });
+
+  res.json({ message: 'Proposal rejected', proposal: data });
+}
+
+export async function approveProposalBatch(req, res) {
+  const { data: proposals, error: fetchErr } = await supabase
+    .from('shift_assignment_proposals')
+    .select('*')
+    .eq('batch_id', req.params.batchId)
+    .eq('status', 'pending');
+  if (fetchErr) return handleError(res, fetchErr);
+  if (!proposals || proposals.length === 0) return res.status(404).json({ error: 'No pending proposals found for that batch' });
+
+  if (proposals.some(p => p.proposed_by === req.admin.id)) {
+    return res.status(403).json({ error: "You can't approve your own proposal — ask another manager or an admin to review it." });
+  }
+
+  const approved = [];
+  const skipped = [];
+  for (const proposal of proposals) {
+    const result = await approveOneProposal(proposal);
+    if (result.ok) {
+      approved.push({ id: proposal.id, date: proposal.date, assignment: result.assignment });
+      await supabase
+        .from('shift_assignment_proposals')
+        .update({ status: 'approved', reviewed_by: req.admin.id, reviewed_at: new Date().toISOString() })
+        .eq('id', proposal.id);
+    } else {
+      skipped.push({ id: proposal.id, date: proposal.date, reason: result.reason });
+    }
+  }
+
+  res.json({ message: `${approved.length} of ${proposals.length} approved`, approved, skipped });
+}
+
+export async function rejectProposalBatch(req, res) {
+  const { reason } = req.body;
+  const { data: proposals, error: fetchErr } = await supabase
+    .from('shift_assignment_proposals')
+    .select('id, proposed_by')
+    .eq('batch_id', req.params.batchId)
+    .eq('status', 'pending');
+  if (fetchErr) return handleError(res, fetchErr);
+  if (!proposals || proposals.length === 0) return res.status(404).json({ error: 'No pending proposals found for that batch' });
+
+  if (proposals.some(p => p.proposed_by === req.admin.id)) {
+    return res.status(403).json({ error: "You can't reject your own proposal — ask another manager or an admin to review it." });
+  }
+
+  const { data, error } = await supabase
+    .from('shift_assignment_proposals')
+    .update({ status: 'rejected', reviewed_by: req.admin.id, reviewed_at: new Date().toISOString(), rejection_reason: reason || null })
+    .eq('batch_id', req.params.batchId)
+    .eq('status', 'pending')
+    .select();
+  if (error) return handleError(res, error);
+
+  broadcastSseEvent('schedule:updated', { type: 'proposal-rejected-batch', batch_id: req.params.batchId, count: data.length, timestamp: new Date().toISOString() });
+
+  res.json({ message: `${data.length} proposal(s) rejected`, proposals: data });
 }

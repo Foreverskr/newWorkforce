@@ -6,7 +6,7 @@
 //
 // Storage shape (single key, easy to inspect in devtools):
 // {
-//   admin: { id, username },
+//   admin: { id, username, name, role, status },  // full admin record from login response
 //   token: '<jwt>',              // sent as Authorization: Bearer <token>
 //   loginAt: 1690000000000,      // when they logged in
 //   lastActivityAt: 1690003600000
@@ -41,6 +41,14 @@ export function getSession() {
   } catch {
     return null;
   }
+}
+
+export function getCurrentUser() {
+  return getSession()?.admin ?? null;
+}
+
+export function getRole() {
+  return getSession()?.admin?.role ?? null;
 }
 
 export function touchSession() {

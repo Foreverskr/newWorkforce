@@ -41,10 +41,16 @@ export async function login(req, res) {
     return res.status(401).json({ error: 'Invalid username or password' });
   }
 
+  // 2.5 Guard against a missing role before signing anything into the token
+  if (!admin.role) {
+    console.error('Admin record missing role:', admin.username);
+    return res.status(500).json({ error: 'Account misconfigured — contact an administrator' });
+  }
+
   // 3. Issue a signed token. The 8hr expiry lives INSIDE the token, so the
   // server itself will reject it after 8 hours — not just the frontend UI.
   const token = jwt.sign(
-    { id: admin.id, username: admin.username },
+    { id: admin.id, username: admin.username, role: admin.role },
     JWT_SECRET,
     { expiresIn: TOKEN_EXPIRY }
   );

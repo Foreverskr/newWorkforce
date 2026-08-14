@@ -100,7 +100,7 @@ export const api = {
   updateShiftTemplate: (id, body) => request(`/shift-templates/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
   deleteShiftTemplate: (id) => request(`/shift-templates/${id}`, { method: 'DELETE' }),
 
-  // Schedule
+ // Schedule
   getSchedule: (params = {}) => {
     const qs = new URLSearchParams(params).toString();
     return request(`/schedule${qs ? `?${qs}` : ''}`);
@@ -108,6 +108,15 @@ export const api = {
   assignShift: (body) => request('/schedule', { method: 'POST', body: JSON.stringify(body) }),
   assignRecurringShift: (body) => request('/schedule/recurring', { method: 'POST', body: JSON.stringify(body) }),
   deleteShiftAssignment: (id) => request(`/schedule/${id}`, { method: 'DELETE' }),
+
+  // Schedule proposals (hr_staff / hr_manager propose → gets approved)
+  proposeShift: (body) => request('/schedule/propose', { method: 'POST', body: JSON.stringify(body) }),
+  proposeRecurringShift: (body) => request('/schedule/propose/recurring', { method: 'POST', body: JSON.stringify(body) }),
+  getPendingProposals: () => request('/schedule/pending'),
+  approveProposal: (id) => request(`/schedule/proposals/${id}/approve`, { method: 'PATCH' }),
+  rejectProposal: (id, reason) => request(`/schedule/proposals/${id}/reject`, { method: 'PATCH', body: JSON.stringify({ reason }) }),
+  approveProposalBatch: (batchId) => request(`/schedule/proposals/batch/${batchId}/approve`, { method: 'PATCH' }),
+  rejectProposalBatch: (batchId, reason) => request(`/schedule/proposals/batch/${batchId}/reject`, { method: 'PATCH', body: JSON.stringify({ reason }) }),
 
   // Drivers
   getDrivers: () => request('/drivers'),
@@ -143,6 +152,15 @@ export const api = {
   createRecurringStaffingRequirement: (body) => request('/staffing-requirements/recurring', { method: 'POST', body: JSON.stringify(body) }),
   updateStaffingRequirement: (id, body) => request(`/staffing-requirements/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
   deleteStaffingRequirement: (id) => request(`/staffing-requirements/${id}`, { method: 'DELETE' }),
+
+  // Staffing requirement proposals (hr_staff / hr_manager propose → gets approved)
+  proposeStaffingRequirement: (body) => request('/staffing-requirements/propose', { method: 'POST', body: JSON.stringify(body) }),
+  proposeRecurringStaffingRequirement: (body) => request('/staffing-requirements/propose/recurring', { method: 'POST', body: JSON.stringify(body) }),
+  getPendingStaffingProposals: () => request('/staffing-requirements/pending'),
+  approveStaffingProposal: (id) => request(`/staffing-requirements/proposals/${id}/approve`, { method: 'PATCH' }),
+  rejectStaffingProposal: (id, reason) => request(`/staffing-requirements/proposals/${id}/reject`, { method: 'PATCH', body: JSON.stringify({ reason }) }),
+  approveStaffingProposalBatch: (batchId) => request(`/staffing-requirements/proposals/batch/${batchId}/approve`, { method: 'PATCH' }),
+  rejectStaffingProposalBatch: (batchId, reason) => request(`/staffing-requirements/proposals/batch/${batchId}/reject`, { method: 'PATCH', body: JSON.stringify({ reason }) }),
 
   getPositions: () => request('/positions'),
 

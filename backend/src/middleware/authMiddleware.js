@@ -22,3 +22,49 @@ export function requireAuth(req, res, next) {
     return res.status(401).json({ error: 'Invalid session', code: 'INVALID_TOKEN' });
   }
 }
+
+const PERMISSIONS = {
+  admin: ['*'],
+
+  hr_manager: [
+    'employees:read',
+    'attendance:read',
+    'leaves:read', 'leaves:approve',
+    'drivers:read',
+    'positions:read',
+    'staffingRequirements:read', 'staffingRequirements:propose', 'staffingRequirements:approve',
+    'analytics:read',
+    'schedule:read', 'schedule:propose', 'schedule:approve',
+    'shiftTemplates:read',
+  ],
+
+  hr_staff: [
+    'employees:read',
+    'attendance:read',
+    'leaves:read',
+    'drivers:read',
+    'positions:read',
+    'staffingRequirements:read', 'staffingRequirements:propose',
+    'schedule:read', 'schedule:propose',
+    'fingerprints:enroll',
+  ],
+};
+
+function hasPermission(role, permission) {
+  const allowed = PERMISSIONS[role] || [];
+  return allowed.includes('*') || allowed.includes(permission);
+}
+
+export function requirePermission(permission) {
+  return (req, res, next) => {
+    if (!req.admin?.role) {
+      return res.status(403).json({ error: 'No role on session' });
+    }
+    if (!hasPermission(req.admin.role, permission)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    next();
+  };
+}
+
+export { hasPermission };

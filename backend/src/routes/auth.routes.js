@@ -1,12 +1,10 @@
 import { Router } from 'express';
 import { login, hashPassword } from '../controllers/auth.controller.js';
+import { requireAuth, requirePermission } from '../middleware/authMiddleware.js';
 
 const router = Router();
 
-// POST /api/auth/login
-router.post('/login', login);
-
-// POST /api/auth/hash
-router.post('/hash', hashPassword);
+router.post('/login', login); // stays open
+router.post('/hash', requireAuth, requirePermission('admins:manage'), hashPassword);
 
 export default router;

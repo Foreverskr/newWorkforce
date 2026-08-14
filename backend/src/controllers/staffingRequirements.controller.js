@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import { supabase } from '../config/supabase.js';
 import { handleError } from '../middleware/errorHandler.js';
 
@@ -158,6 +159,204 @@ export async function deleteRequirement(req, res) {
     removed_assignments_count: removedAssignments.length,
     removed_assignments: removedAssignments,
   });
+}
+
+// ── Staffing requirement proposals (hr_staff / hr_manager propose → gets approved) ──
+
+export async function proposeRequirement(req, res) {
+  const { position_id, shift_template_id, date, required_count, notes } = req.body;
+  if (!position_id || !shift_template_id || !date || !required_count) {
+    return res.status(400).json({ error: 'position_id, shift_template_id, date, and required_count (>= 1) are required' });
+  }
+  if (required_count < 1) {
+    return res.status(400).json({ error: 'required_count must be at least 1' });
+  }
+
+  const { data, error } = await supabase
+    .from('staffing_requirement_proposals')
+    .insert([{
+      position_id,
+      shift_template_id,
+      date,
+      required_count,
+      notes: notes || null,
+      status: 'pending',
+      proposed_by: req.admin.id,
+    }])
+    .select()
+    .single();
+  if (error) return handleError(res, error);
+  res.status(201).json(data);
+}
+
+export async function proposeRecurringRequirement(req, res) {
+  const { position_id, shift_template_id, start_date, end_date, days_of_week, required_count, notes } = req.body;
+  if (!position_id || !shift_template_id || !start_date || !end_date || !Array.isArray(days_of_week) || days_of_week.length === 0 || !required_count) {
+    return res.status(400).json({ error: 'position_id, shift_template_id, start_date, end_date, days_of_week[], and required_count (>= 1) are required' });
+  }
+  if (required_count < 1) return res.status(400).json({ error: 'required_count must be at least 1' });
+
+  const dowSet = new Set(days_of_week.map(Number));
+  const dates = [];
+  const cur = new Date(start_date);
+  const end = new Date(end_date);
+  while (cur <= end) {
+    if (dowSet.has(cur.getDay())) dates.push(cur.toISOString().split('T')[0]);
+    cur.setDate(cur.getDate() + 1);
+  }
+  if (dates.length === 0) return res.status(400).json({ error: 'No matching dates found for the given days_of_week in that range' });
+
+  const batch_id = randomUUID();
+  const records = dates.map(date => ({
+    position_id,
+    shift_template_id,
+    date,
+    required_count,
+    notes: notes || null,
+    status: 'pending',
+    proposed_by: req.admin.id,
+    batch_id,
+  }));
+
+  const { data, error } = await supabase
+    .from('staffing_requirement_proposals')
+    .insert(records)
+    .select();
+  if (error) return handleError(res, error);
+  res.status(201).json({ created: data.length, batch_id, proposals: data });
+}
+
+export async function getPendingRequirementProposals(req, res) {
+  const { data, error } = await supabase
+    .from('staffing_requirement_proposals')
+    .select('*, positions(name), roles(name, start_time, end_time, color), proposer:proposed_by(username)')
+    .eq('status', 'pending')
+    .order('created_at', { ascending: false });
+  if (error) return handleError(res, error);
+  res.json(data);
+}
+
+// Writes one pending proposal into the live staffing_requirements table.
+// Returns { ok, requirement } or { ok: false, reason }.
+async function approveOneRequirementProposal(proposal) {
+  const { data: requirement, error: writeErr } = await supabase
+    .from('staffing_requirements')
+    .upsert([{
+      position_id: proposal.position_id,
+      shift_template_id: proposal.shift_template_id,
+      date: proposal.date,
+      required_count: proposal.required_count,
+      notes: proposal.notes,
+      updated_at: new Date().toISOString(),
+    }], { onConflict: 'position_id,shift_template_id,date' })
+    .select()
+    .single();
+  if (writeErr) return { ok: false, reason: writeErr.message || 'Failed to write requirement' };
+  return { ok: true, requirement };
+}
+
+export async function approveRequirementProposal(req, res) {
+  const { data: proposal, error: fetchErr } = await supabase
+    .from('staffing_requirement_proposals')
+    .select('*')
+    .eq('id', req.params.id)
+    .eq('status', 'pending')
+    .single();
+  if (fetchErr || !proposal) return res.status(404).json({ error: 'Pending proposal not found' });
+
+  if (proposal.proposed_by === req.admin.id) {
+    return res.status(403).json({ error: "You can't approve your own proposal — ask another manager or an admin to review it." });
+  }
+
+  const result = await approveOneRequirementProposal(proposal);
+  if (!result.ok) return res.status(409).json({ error: result.reason });
+
+  await supabase
+    .from('staffing_requirement_proposals')
+    .update({ status: 'approved', reviewed_by: req.admin.id, reviewed_at: new Date().toISOString() })
+    .eq('id', proposal.id);
+
+  res.json({ message: 'Proposal approved and applied to staffing requirements', requirement: result.requirement });
+}
+
+export async function rejectRequirementProposal(req, res) {
+  const { reason } = req.body;
+  const { data: proposal, error: fetchErr } = await supabase
+    .from('staffing_requirement_proposals')
+    .select('id, proposed_by')
+    .eq('id', req.params.id)
+    .eq('status', 'pending')
+    .single();
+  if (fetchErr || !proposal) return res.status(404).json({ error: 'Pending proposal not found' });
+  if (proposal.proposed_by === req.admin.id) {
+    return res.status(403).json({ error: "You can't reject your own proposal — ask another manager or an admin to review it." });
+  }
+
+  const { data, error } = await supabase
+    .from('staffing_requirement_proposals')
+    .update({ status: 'rejected', reviewed_by: req.admin.id, reviewed_at: new Date().toISOString(), rejection_reason: reason || null })
+    .eq('id', req.params.id)
+    .eq('status', 'pending')
+    .select()
+    .single();
+  if (error) return handleError(res, error);
+  if (!data) return res.status(404).json({ error: 'Pending proposal not found' });
+  res.json({ message: 'Proposal rejected', proposal: data });
+}
+
+export async function approveRequirementProposalBatch(req, res) {
+  const { data: proposals, error: fetchErr } = await supabase
+    .from('staffing_requirement_proposals')
+    .select('*')
+    .eq('batch_id', req.params.batchId)
+    .eq('status', 'pending');
+  if (fetchErr) return handleError(res, fetchErr);
+  if (!proposals || proposals.length === 0) return res.status(404).json({ error: 'No pending proposals found for that batch' });
+
+  if (proposals.some(p => p.proposed_by === req.admin.id)) {
+    return res.status(403).json({ error: "You can't approve your own proposal — ask another manager or an admin to review it." });
+  }
+
+  const approved = [];
+  const skipped = [];
+  for (const proposal of proposals) {
+    const result = await approveOneRequirementProposal(proposal);
+    if (result.ok) {
+      approved.push({ id: proposal.id, date: proposal.date, requirement: result.requirement });
+      await supabase
+        .from('staffing_requirement_proposals')
+        .update({ status: 'approved', reviewed_by: req.admin.id, reviewed_at: new Date().toISOString() })
+        .eq('id', proposal.id);
+    } else {
+      skipped.push({ id: proposal.id, date: proposal.date, reason: result.reason });
+    }
+  }
+
+  res.json({ message: `${approved.length} of ${proposals.length} approved`, approved, skipped });
+}
+
+export async function rejectRequirementProposalBatch(req, res) {
+  const { reason } = req.body;
+  const { data: proposals, error: fetchErr } = await supabase
+    .from('staffing_requirement_proposals')
+    .select('id, proposed_by')
+    .eq('batch_id', req.params.batchId)
+    .eq('status', 'pending');
+  if (fetchErr) return handleError(res, fetchErr);
+  if (!proposals || proposals.length === 0) return res.status(404).json({ error: 'No pending proposals found for that batch' });
+
+  if (proposals.some(p => p.proposed_by === req.admin.id)) {
+    return res.status(403).json({ error: "You can't reject your own proposal — ask another manager or an admin to review it." });
+  }
+
+  const { data, error } = await supabase
+    .from('staffing_requirement_proposals')
+    .update({ status: 'rejected', reviewed_by: req.admin.id, reviewed_at: new Date().toISOString(), rejection_reason: reason || null })
+    .eq('batch_id', req.params.batchId)
+    .eq('status', 'pending')
+    .select();
+  if (error) return handleError(res, error);
+  res.json({ message: `${data.length} proposal(s) rejected`, proposals: data });
 }
 
 export async function getCoverage(req, res) {

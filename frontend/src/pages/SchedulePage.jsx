@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { Calendar, Plus, Trash2, Clock, AlertTriangle, Truck, Users, UserCheck, Search, Sun, Moon, ChevronLeft, ChevronRight, ChevronDown } from 'lucide-react';
 import { api } from '../lib/api';
+import { getRole, getCurrentUser } from '../utils/session.js';
 
 // ─── Date Helpers ──────────────────────────────────────────────────────────────
 function toISODate(d) {
@@ -125,7 +126,7 @@ function ShiftTemplateModal({ templates, onClose, onSave, onDelete, onToast }) {
   );
 }
 
-function AssignShiftModal({ employees, templates, positions, defaultPosition, onClose, onAssign, onAssignRecurring, onToast }) {
+function AssignShiftModal({ employees, templates, positions, defaultPosition, directWrite, onClose, onAssign, onAssignRecurring, onToast }) {
   const [mode, setMode] = useState('single');
   const [entryType, setEntryType] = useState(templates.length === 0 ? 'dayoff' : 'shift');
   const [positionFilter, setPositionFilter] = useState(defaultPosition || 'all');
@@ -169,7 +170,8 @@ function AssignShiftModal({ employees, templates, positions, defaultPosition, on
           }
         }
       }
-      onToast(isDayOff ? 'Rest day set' : 'Shift assigned', 'success');
+      const verb = directWrite ? (isDayOff ? 'Rest day set' : 'Shift assigned') : (isDayOff ? 'Rest day proposed — pending approval' : 'Shift proposed — pending approval');
+      onToast(verb, 'success');
       onClose();
     } catch (e) { onToast(e.message, 'error'); }
     finally { setSaving(false); }
@@ -178,7 +180,7 @@ function AssignShiftModal({ employees, templates, positions, defaultPosition, on
   return (
     <div className="modal-overlay">
       <div className="modal">
-        <div className="modal-header"><span className="modal-title">Assign Shift</span><button className="btn btn-icon btn-ghost" onClick={onClose}>✕</button></div>
+        <div className="modal-header"><span className="modal-title">{directWrite ? 'Assign Shift' : 'Propose Shift'}</span><button className="btn btn-icon btn-ghost" onClick={onClose}>✕</button></div>
         <div className="flex-center gap-2" style={{ marginBottom: 12 }}>
           <button className={`btn btn-sm ${mode === 'single' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setMode('single')}><Calendar size={13} /> Single</button>
           <button className={`btn btn-sm ${mode === 'recurring' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setMode('recurring')}><Clock size={13} /> Recurring</button>
@@ -262,7 +264,7 @@ function AssignShiftModal({ employees, templates, positions, defaultPosition, on
         </div>
         <div className="modal-footer">
           <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
-          <button className="btn btn-primary" onClick={submit} disabled={saving}>{saving ? 'Saving…' : 'Assign'}</button>
+          <button className="btn btn-primary" onClick={submit} disabled={saving}>{saving ? 'Saving…' : directWrite ? 'Assign' : 'Propose'}</button>
         </div>
       </div>
     </div>
@@ -311,13 +313,18 @@ function DriverAvailabilityPanel({ onToast }) {
     load();
   }, [date]);
 
+  // Keep a ref to the latest `load` so the SSE listener always calls the
+  // current version without needing to reconnect every time `date` changes.
+  const loadRef = useRef(load);
+  useEffect(() => { loadRef.current = load; });
+
   useEffect(() => {
     const source = new EventSource('/api/events');
     source.addEventListener('attendance:updated', () => {
-      load();
+      loadRef.current();
     });
     return () => source.close();
-  }, [date]);
+  }, []); // connect once, stay connected for the life of this component
   useEffect(() => { setPage(0); }, [date]);
   const pageCount = Math.max(1, Math.ceil(drivers.length / PAGE_SIZE));
   useEffect(() => { if (page > pageCount - 1) setPage(pageCount - 1); }, [pageCount, page]);
@@ -358,10 +365,198 @@ function DriverAvailabilityPanel({ onToast }) {
   );
 }
 
+// ─── Pending Schedule Proposals Panel (hr_manager / admin only) ────────────────
+// Groups a flat proposal list into { batches: [[batch_id, rows]], singles: [rows without a batch_id] }
+// so a recurring submission (one row per date, sharing a batch_id) reviews as one item.
+function groupProposals(list) {
+  const batchMap = {};
+  const singles = [];
+  for (const p of list) {
+    if (p.batch_id) (batchMap[p.batch_id] ||= []).push(p);
+    else singles.push(p);
+  }
+  return { batches: Object.entries(batchMap), singles };
+}
+
+function ProposalRowActions({ id, batchId, proposedBy, currentUserId, actingKey, onApprove, onReject }) {
+  const key = batchId || id;
+  const isOwn = proposedBy && currentUserId && proposedBy === currentUserId;
+  if (isOwn) {
+    return <span className="text-dim text-sm" title="Someone else needs to review this">Awaiting another reviewer</span>;
+  }
+  return (
+    <div className="flex-center gap-2">
+      <button className="btn btn-primary btn-sm" onClick={() => onApprove(key, batchId)} disabled={actingKey === key}>Approve</button>
+      <button className="btn btn-danger btn-sm" onClick={() => onReject(key, batchId)} disabled={actingKey === key}>Reject</button>
+    </div>
+  );
+}
+
+function PendingProposalsPanel({ onToast, refreshSignal }) {
+  const currentUserId = getCurrentUser()?.id;
+  const [shiftProposals, setShiftProposals] = useState([]);
+  const [reqProposals, setReqProposals] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [actingKey, setActingKey] = useState(null);
+  const [collapsed, setCollapsed] = useState(false);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const [shifts, reqs] = await Promise.all([api.getPendingProposals(), api.getPendingStaffingProposals()]);
+      setShiftProposals(shifts);
+      setReqProposals(reqs);
+    } catch (e) { onToast(e.message, 'error'); }
+    finally { setLoading(false); }
+  };
+
+  useEffect(() => { load(); }, [refreshSignal]);
+
+  const loadRef = useRef(load);
+  useEffect(() => { loadRef.current = load; });
+
+  useEffect(() => {
+    const source = new EventSource('/api/events');
+    source.addEventListener('schedule:updated', () => {
+      loadRef.current();
+    });
+    return () => source.close();
+  }, []);
+
+  const approveShift = async (key, batchId) => {
+    setActingKey(key);
+    try {
+      if (batchId) await api.approveProposalBatch(batchId); else await api.approveProposal(key);
+      onToast('Proposal approved', 'success'); load();
+    } catch (e) { onToast(e.message, 'error'); }
+    finally { setActingKey(null); }
+  };
+  const rejectShift = async (key, batchId) => {
+    const reason = prompt('Reason for rejecting this proposal (optional):') || '';
+    setActingKey(key);
+    try {
+      if (batchId) await api.rejectProposalBatch(batchId, reason); else await api.rejectProposal(key, reason);
+      onToast('Proposal rejected', 'success'); load();
+    } catch (e) { onToast(e.message, 'error'); }
+    finally { setActingKey(null); }
+  };
+
+  const approveReq = async (key, batchId) => {
+    setActingKey(key);
+    try {
+      if (batchId) await api.approveStaffingProposalBatch(batchId); else await api.approveStaffingProposal(key);
+      onToast('Proposal approved', 'success'); load();
+    } catch (e) { onToast(e.message, 'error'); }
+    finally { setActingKey(null); }
+  };
+  const rejectReq = async (key, batchId) => {
+    const reason = prompt('Reason for rejecting this proposal (optional):') || '';
+    setActingKey(key);
+    try {
+      if (batchId) await api.rejectStaffingProposalBatch(batchId, reason); else await api.rejectStaffingProposal(key, reason);
+      onToast('Proposal rejected', 'success'); load();
+    } catch (e) { onToast(e.message, 'error'); }
+    finally { setActingKey(null); }
+  };
+
+  const totalCount = shiftProposals.length + reqProposals.length;
+  if (!loading && totalCount === 0) return null; // nothing to review — stay out of the way
+
+  const { batches: shiftBatches, singles: shiftSingles } = groupProposals(shiftProposals);
+  const { batches: reqBatches, singles: reqSingles } = groupProposals(reqProposals);
+
+  return (
+    <div className="card" style={{ marginBottom: 20 }}>
+      <div className="flex-between" style={{ marginBottom: collapsed ? 0 : 12 }}>
+        <div className="flex-center" style={{ gap: 8 }}>
+          <button className="btn btn-icon btn-ghost btn-sm" onClick={() => setCollapsed(c => !c)}>
+            {collapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+          </button>
+          <Calendar size={16} /><strong>Pending Proposals</strong>
+          <span className="badge" style={{ background: 'rgba(245,158,11,0.18)', color: '#f59e0b' }}>{totalCount}</span>
+        </div>
+      </div>
+      {!collapsed && (loading ? <div className="loading"><div className="spinner" /> Loading...</div> : (
+        <>
+          {(shiftSingles.length > 0 || shiftBatches.length > 0) && (
+            <div className="table-wrap" style={{ marginBottom: (reqSingles.length > 0 || reqBatches.length > 0) ? 16 : 0 }}>
+              <table>
+                <thead><tr><th>Employee</th><th>Date(s)</th><th>Shift</th><th>Proposed by</th><th></th></tr></thead>
+                <tbody>
+                  {shiftSingles.map(p => (
+                    <tr key={p.id}>
+                      <td>{p.employees?.name || '—'}</td>
+                      <td>{p.date}</td>
+                      <td>{p.is_day_off ? <span className="badge inactive">Rest Day</span> : (p.shift_templates?.name || '—')}</td>
+                      <td className="text-dim text-sm">{p.proposer?.username || '—'}</td>
+                      <td>
+                        <ProposalRowActions id={p.id} proposedBy={p.proposed_by} currentUserId={currentUserId} actingKey={actingKey} onApprove={approveShift} onReject={rejectShift} />
+                      </td>
+                    </tr>
+                  ))}
+                  {shiftBatches.map(([batchId, rows]) => {
+                    const dates = rows.map(r => r.date).sort();
+                    const first = rows[0];
+                    return (
+                      <tr key={batchId}>
+                        <td>{first.employees?.name || '—'}</td>
+                        <td>{dates[0]} → {dates[dates.length - 1]} <span className="text-dim text-sm">({rows.length} day(s))</span></td>
+                        <td>{first.is_day_off ? <span className="badge inactive">Rest Day</span> : (first.shift_templates?.name || '—')}</td>
+                        <td className="text-dim text-sm">{first.proposer?.username || '—'}</td>
+                        <td>
+                          <ProposalRowActions id={first.id} batchId={batchId} proposedBy={first.proposed_by} currentUserId={currentUserId} actingKey={actingKey} onApprove={approveShift} onReject={rejectShift} />
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {(reqSingles.length > 0 || reqBatches.length > 0) && (
+            <div className="table-wrap">
+              <table>
+                <thead><tr><th>Position</th><th>Date(s)</th><th>Shift</th><th>Required</th><th>Proposed by</th><th></th></tr></thead>
+                <tbody>
+                  {reqSingles.map(p => (
+                    <tr key={p.id}>
+                      <td>{p.positions?.name || '—'}</td>
+                      <td>{p.date}</td>
+                      <td>{p.roles?.name || '—'}</td>
+                      <td>{p.required_count}</td>
+                      <td className="text-dim text-sm">{p.proposer?.username || '—'}</td>
+                      <td>
+                        <ProposalRowActions id={p.id} proposedBy={p.proposed_by} currentUserId={currentUserId} actingKey={actingKey} onApprove={approveReq} onReject={rejectReq} />
+                      </td>
+                    </tr>
+                  ))}
+                  {reqBatches.map(([batchId, rows]) => {
+                    const dates = rows.map(r => r.date).sort();
+                    const first = rows[0];
+                    return (
+                      <tr key={batchId}>
+                        <td>{first.positions?.name || '—'}</td>
+                        <td>{dates[0]} → {dates[dates.length - 1]} <span className="text-dim text-sm">({rows.length} day(s))</span></td>
+                        <td>{first.roles?.name || '—'}</td>
+                        <td>{first.required_count}</td>
+                        <td className="text-dim text-sm">{first.proposer?.username || '—'}</td>
+                        <td>
+                          <ProposalRowActions id={first.id} batchId={batchId} proposedBy={first.proposed_by} currentUserId={currentUserId} actingKey={actingKey} onApprove={approveReq} onReject={rejectReq} />
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
+      ))}
+    </div>
+  );
+}
+
 // ─── Requirements Matrix (compact, one row per shift type) ─────────────────────
-// `highlightedCell` is a `${shiftTemplateId}-${date}` key set by the "N short-staffed"
-// jump action below — when it matches a cell in THIS matrix, we scroll to it and give
-// it a temporary glow so it's obvious which slot was meant, even after switching tabs.
 function RequirementsMatrix({ positionName, rows, dates, onCellClick, onDeleteRow, highlightedCell }) {
   const cellRefs = useRef({});
 
@@ -435,14 +630,16 @@ function RequirementsMatrix({ positionName, rows, dates, onCellClick, onDeleteRo
                     );
                   })}
                   <td style={{ textAlign: 'center', padding: '0 4px' }}>
-                    <button
-                      className="btn btn-icon btn-ghost btn-sm"
-                      onClick={() => onDeleteRow(row)}
-                      title={`Remove ${row.name} for the whole week`}
-                      style={{ color: 'var(--danger, #ef4444)' }}
-                    >
-                      <Trash2 size={13} />
-                    </button>
+                    {onDeleteRow && (
+                      <button
+                        className="btn btn-icon btn-ghost btn-sm"
+                        onClick={() => onDeleteRow(row)}
+                        title={`Remove ${row.name} for the whole week`}
+                        style={{ color: 'var(--danger, #ef4444)' }}
+                      >
+                        <Trash2 size={13} />
+                      </button>
+                    )}
                   </td>
                 </tr>
               );
@@ -455,13 +652,86 @@ function RequirementsMatrix({ positionName, rows, dates, onCellClick, onDeleteRo
   );
 }
 
+// ─── Assignment Detail (pop-up) ─────────────────────────────────────────────
+function AssignmentDetailModal({ assignment, employee, onClose, onRemove }) {
+  const isDayOff = assignment.is_day_off;
+  const [removing, setRemoving] = useState(false);
+
+  const doRemove = async () => {
+    setRemoving(true);
+    try { await onRemove(assignment); onClose(); }
+    finally { setRemoving(false); }
+  };
+
+  return (
+    <div className="modal-overlay">
+      <div className="modal" style={{ maxWidth: 380 }}>
+        <div className="modal-header">
+          <span className="modal-title">Assignment Detail</span>
+          <button className="btn btn-icon btn-ghost" onClick={onClose}>✕</button>
+        </div>
+        <div style={{ padding: '4px 0 16px', fontSize: '0.85rem' }}>
+          <div className="flex-between" style={{ padding: '8px 0', borderBottom: '1px solid var(--border-light)' }}>
+            <span className="text-dim">Employee</span>
+            <span style={{ fontWeight: 600 }}>{employee?.name || '—'} {employee?.employee_id ? `(${employee.employee_id})` : ''}</span>
+          </div>
+          <div className="flex-between" style={{ padding: '8px 0', borderBottom: '1px solid var(--border-light)' }}>
+            <span className="text-dim">Date</span>
+            <span style={{ fontWeight: 600 }}>
+              {new Date(assignment.date + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })}
+            </span>
+          </div>
+          <div className="flex-between" style={{ padding: '8px 0', borderBottom: '1px solid var(--border-light)' }}>
+            <span className="text-dim">Shift</span>
+            {isDayOff ? (
+              <span className="badge inactive">Rest Day</span>
+            ) : (
+              <span className="flex-center" style={{ gap: 6, fontWeight: 600 }}>
+                <span style={{ width: 8, height: 8, borderRadius: '50%', background: assignment.shift_templates?.color || '#3b82f6' }} />
+                {assignment.shift_templates?.name || 'Shift'} ({formatTime(assignment.shift_templates?.start_time)} – {formatTime(assignment.shift_templates?.end_time)})
+              </span>
+            )}
+          </div>
+          <div className="flex-between" style={{ padding: '8px 0', borderBottom: '1px solid var(--border-light)' }}>
+            <span className="text-dim">Status</span>
+            <span style={{ fontWeight: 600 }}>Assigned</span>
+          </div>
+          {assignment.notes && (
+            <div style={{ padding: '8px 0' }}>
+              <span className="text-dim">Notes</span>
+              <div style={{ marginTop: 4 }}>{assignment.notes}</div>
+            </div>
+          )}
+        </div>
+        <div className="modal-footer">
+          <button className="btn btn-danger" onClick={doRemove} disabled={removing}>
+            <Trash2 size={13} /> {removing ? 'Removing…' : 'Remove'}
+          </button>
+          <button className="btn btn-ghost" onClick={onClose}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Employee schedule list (compact, single position) ─────────────────────────
-// Cell priority: approved leave > rest day > shift > empty. Leave wins even over an
-// existing rest-day/shift assignment for that date, since it reflects what's actually
-// going to happen — the underlying assignment record is left alone (Leaves page owns
-// approving/revoking it), this just changes what's displayed.
 function EmployeeScheduleGroup({ position, employees, dates, assignmentMap, leaveMap, onRemove }) {
   const scheduledCount = employees.filter(e => dates.some(date => assignmentMap[date]?.[e.id])).length;
+  const [detail, setDetail] = useState(null); // { assignment, employee }
+
+  const legendShifts = useMemo(() => {
+    const seen = new Map();
+    dates.forEach(date => {
+      employees.forEach(e => {
+        const a = assignmentMap[date]?.[e.id];
+        if (a && !a.is_day_off && a.shift_templates?.name && !seen.has(a.shift_templates.name)) {
+          seen.set(a.shift_templates.name, a.shift_templates);
+        }
+      });
+    });
+    return [...seen.values()];
+  }, [dates, employees, assignmentMap]);
+
   return (
     <div>
       <div className="text-dim text-sm" style={{ marginBottom: 8, fontWeight: 600 }}>
@@ -506,13 +776,25 @@ function EmployeeScheduleGroup({ position, employees, dates, assignmentMap, leav
                       ) : !a ? (
                         <span style={{ color: 'var(--text-muted)' }}>—</span>
                       ) : a.is_day_off ? (
-                        <span className="badge inactive" style={{ fontSize: '0.68rem', padding: '3px 6px', cursor: 'pointer' }} onClick={() => onRemove(a)} title="Click to remove">Rest</span>
+                        <span className="badge inactive" style={{ fontSize: '0.68rem', padding: '3px 6px', cursor: 'pointer' }} onClick={() => setDetail({ assignment: a, employee: emp })} title="Click for details">Rest</span>
                       ) : (
-                        <span
-                          onClick={() => onRemove(a)}
-                          title="Click to remove"
-                          style={{ display: 'inline-block', padding: '3px 6px', borderRadius: 5, fontSize: '0.7rem', fontWeight: 700, color: '#fff', background: a.shift_templates?.color || '#3b82f6', cursor: 'pointer' }}
-                        >{shortRange(a.shift_templates?.start_time, a.shift_templates?.end_time)}</span>
+                        (() => {
+                          const ShiftGlyph = shiftIcon(a.shift_templates?.name);
+                          return (
+                            <span
+                              onClick={() => setDetail({ assignment: a, employee: emp })}
+                              title={`${a.shift_templates?.name || 'Shift'} · click for details`}
+                              style={{
+                                display: 'inline-flex', alignItems: 'center', gap: 4, padding: '3px 6px', borderRadius: 5,
+                                fontSize: '0.7rem', fontWeight: 700, color: '#fff',
+                                background: a.shift_templates?.color || '#3b82f6', cursor: 'pointer',
+                              }}
+                            >
+                              <ShiftGlyph size={10} />
+                              {shortRange(a.shift_templates?.start_time, a.shift_templates?.end_time)}
+                            </span>
+                          );
+                        })()
                       )}
                     </td>
                   );
@@ -522,15 +804,86 @@ function EmployeeScheduleGroup({ position, employees, dates, assignmentMap, leav
           </tbody>
         </table>
       </div>
+
+      {(legendShifts.length > 0 || employees.some(e => dates.some(d => assignmentMap[d]?.[e.id]?.is_day_off))) && (
+        <div className="flex-center gap-3" style={{ flexWrap: 'wrap', marginTop: 10, fontSize: '0.72rem' }}>
+          {legendShifts.map(t => (
+            <span key={t.name} className="flex-center" style={{ gap: 5 }}>
+              <span style={{ width: 9, height: 9, borderRadius: 3, background: t.color || '#3b82f6', display: 'inline-block' }} />
+              <span className="text-dim">{t.name} ({shortRange(t.start_time, t.end_time)})</span>
+            </span>
+          ))}
+          <span className="flex-center" style={{ gap: 5 }}>
+            <span style={{ width: 9, height: 9, borderRadius: 3, background: 'var(--border)', display: 'inline-block' }} />
+            <span className="text-dim">Rest / Off</span>
+          </span>
+          <span className="flex-center" style={{ gap: 5 }}>
+            <span style={{ width: 9, height: 9, borderRadius: 3, background: '#8b5cf6', display: 'inline-block' }} />
+            <span className="text-dim">Leave</span>
+          </span>
+        </div>
+      )}
+
+      {detail && (
+        <AssignmentDetailModal
+          assignment={detail.assignment}
+          employee={detail.employee}
+          onClose={() => setDetail(null)}
+          onRemove={onRemove}
+        />
+      )}
+    </div>
+  );
+}
+
+// ─── Stat Cards ──────────────────────────────────────────────────────────────
+function StatCard({ label, value, tone, icon: Icon, onClick }) {
+  const toneColor = tone === 'danger' ? 'var(--danger, #ef4444)'
+    : tone === 'warn' ? '#f59e0b'
+    : tone === 'accent' ? 'var(--primary, #3b82f6)'
+    : 'var(--green, #10b981)';
+  return (
+    <div
+      className="card"
+      onClick={onClick}
+      style={{
+        flex: '1 1 140px', padding: '14px 16px', cursor: onClick ? 'pointer' : 'default',
+        display: 'flex', alignItems: 'center', gap: 12, minWidth: 140,
+      }}
+    >
+      <div style={{
+        width: 34, height: 34, borderRadius: 8, flexShrink: 0,
+        background: `${toneColor}22`, color: toneColor,
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+      }}>
+        <Icon size={17} />
+      </div>
+      <div>
+        <div style={{ fontSize: '1.15rem', fontWeight: 700, lineHeight: 1.1 }}>{value}</div>
+        <div className="text-dim" style={{ fontSize: '0.72rem', marginTop: 2 }}>{label}</div>
+      </div>
+    </div>
+  );
+}
+
+function ScheduleStatCards({ totals, understaffedCount, onLeaveCount, unscheduledCount, onJumpShortStaffed }) {
+  return (
+    <div className="flex-center gap-2" style={{ flexWrap: 'wrap', marginBottom: 16 }}>
+      <StatCard label="Slots filled" value={`${totals.total_assigned}/${totals.total_required}`} tone="accent" icon={UserCheck} />
+      <StatCard
+        label="Short-staffed"
+        value={understaffedCount}
+        tone={understaffedCount > 0 ? 'danger' : 'success'}
+        icon={AlertTriangle}
+        onClick={understaffedCount > 0 ? onJumpShortStaffed : undefined}
+      />
+      <StatCard label="On leave today" value={onLeaveCount} tone="warn" icon={Calendar} />
+      <StatCard label="Unscheduled" value={unscheduledCount} tone={unscheduledCount > 0 ? 'warn' : 'success'} icon={Users} />
     </div>
   );
 }
 
 // ─── Position Picker ─────────────────────────────────────────────────────────
-// Up to `threshold` positions: simple tabs, quick to scan and one click away.
-// Beyond that: tabs stop scaling (wrapping / horizontal scrolling gets messy),
-// so switch to a compact searchable dropdown instead — same pattern Deputy /
-// 7shifts use once a business has more than a handful of roles or departments.
 function PositionPicker({ tabs, selected, onSelect, threshold = 6 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -605,6 +958,10 @@ function PositionPicker({ tabs, selected, onSelect, threshold = 6 }) {
 
 // ─── MAIN SCHEDULE PAGE ──────────────────────────────────────────────────────
 export default function SchedulePage({ onToast }) {
+  const role = getRole(); // 'admin' | 'hr_manager' | 'hr_staff'
+  const canManageDirectly = role === 'admin'; // direct writes are admin-only per backend
+  const canApprove = role === 'admin' || role === 'hr_manager';
+
   const [employees, setEmployees] = useState([]);
   const [templates, setTemplates] = useState([]);
   const [positions, setPositions] = useState([]);
@@ -619,18 +976,14 @@ export default function SchedulePage({ onToast }) {
   // Requirement Modal State
   const [showReqModal, setShowReqModal] = useState(false);
   const [editingReq, setEditingReq] = useState(null);
-  const [reqDays, setReqDays] = useState([]); // dates a NEW requirement should be created for (defaults to the whole visible week)
+  const [reqDays, setReqDays] = useState([]);
 
-  // Position tab (single-select — one role/department in view at a time, like a real shift-planning tool)
   const [selectedPosition, setSelectedPosition] = useState(null);
 
-  // Employee list search / filter state
   const [search, setSearch] = useState('');
   const [showScheduled, setShowScheduled] = useState(false);
   const [showNoShifts, setShowNoShifts] = useState(false);
 
-  // "N short-staffed" jump target — `${shiftTemplateId}-${date}`, cleared a couple
-  // seconds after it's shown so the glow in RequirementsMatrix doesn't linger forever.
   const [highlightedCell, setHighlightedCell] = useState(null);
   const [understaffedCursor, setUnderstaffedCursor] = useState(0);
 
@@ -665,15 +1018,27 @@ export default function SchedulePage({ onToast }) {
 
   useEffect(() => { load(); }, [range.start, range.end]);
 
+  // Keep a ref to the latest `load` so the SSE listener always calls the
+  // current version without needing to reconnect every time the visible
+  // date range changes.
+  const loadRef = useRef(load);
+  useEffect(() => { loadRef.current = load; });
+
   useEffect(() => {
     const source = new EventSource('/api/events');
     source.addEventListener('attendance:updated', () => {
-      load();
+      loadRef.current();
+    });
+    // Assignment/requirement changes (assign, remove, propose, approve, reject)
+    // are a different kind of change than clock-in/out — listen separately so
+    // a delete made in one session (e.g. Admin) refreshes other open sessions
+    // (e.g. HR) instead of only updating local state for whoever clicked it.
+    source.addEventListener('schedule:updated', () => {
+      loadRef.current();
     });
     return () => source.close();
-  }, [range.start, range.end]);
+  }, []); // connect once, stay connected for the life of this component
 
-  // Auto-clear the short-staffed highlight after a couple seconds
   useEffect(() => {
     if (!highlightedCell) return;
     const t = setTimeout(() => setHighlightedCell(null), 2500);
@@ -688,7 +1053,6 @@ export default function SchedulePage({ onToast }) {
   const deleteTemplate = async (id) => { await api.deleteShiftTemplate(id); setTemplates(ts => ts.filter(t => t.id !== id)); onToast('Template deleted', 'success'); };
 
   const removeAssignment = async (assignment) => {
-    if (!confirm('Remove this assignment?')) return;
     try { await api.deleteShiftAssignment(assignment.id); setAssignments(a => a.filter(x => x.id !== assignment.id)); onToast('Assignment removed', 'success'); }
     catch (e) { onToast(e.message, 'error'); }
   };
@@ -699,11 +1063,6 @@ export default function SchedulePage({ onToast }) {
     catch (e) { onToast(e.message, 'error'); }
   };
 
-  // Removes every day's requirement for one shift row (e.g. all 7 "Morning
-  // Shift" cells) in a single action, instead of clicking each day's cell
-  // one at a time. Kept alongside the per-cell delete (via onCellClick →
-  // removeRequirement above) rather than replacing it — sometimes you only
-  // want to clear one day.
   const deleteRequirementRow = async (row) => {
     const cellIds = Object.values(row.cells).map(c => c.id).filter(Boolean);
     if (cellIds.length === 0) return;
@@ -715,7 +1074,6 @@ export default function SchedulePage({ onToast }) {
     } catch (e) { onToast(e.message, 'error'); }
   };
 
-  // ─── DATE RANGE ────────────────────────────────────────────────────────────
   const datesInRange = useMemo(() => {
     const dates = [];
     let current = new Date(range.start);
@@ -730,8 +1088,6 @@ export default function SchedulePage({ onToast }) {
     return map;
   }, [assignments]);
 
-  // date -> employee_id -> leave record, for every approved leave that overlaps
-  // this date. Rebuilt whenever the leave list or visible date range changes.
   const leaveMap = useMemo(() => {
     const map = {};
     leaves
@@ -749,9 +1105,6 @@ export default function SchedulePage({ onToast }) {
 
   const activeEmployees = useMemo(() => employees.filter(e => e.status === 'active'), [employees]);
 
-  // ─── POSITION TABS ─────────────────────────────────────────────────────────
-  // Real-world shift tools (Deputy, When I Work, 7shifts) show one role/department at a
-  // time rather than one long stacked list — so build a tab per position with a headcount.
   const positionTabs = useMemo(() => {
     const counts = {};
     activeEmployees.forEach(e => { const key = e.position || 'Unassigned'; counts[key] = (counts[key] || 0) + 1; });
@@ -767,11 +1120,6 @@ export default function SchedulePage({ onToast }) {
     }
   }, [positionTabs]);
 
-  // Positions table can contain rows nobody is actually staffed under (roles created
-  // then abandoned) and occasional duplicate names (same role added twice). Dropdowns
-  // that let you pick a position to assign/require should only offer ones that are
-  // actually in use — i.e. at least one employee currently has that position — and
-  // only once each.
   const activePositions = useMemo(() => {
     const usedNames = new Set(positionTabs.map(t => t.name));
     const seen = new Set();
@@ -782,22 +1130,11 @@ export default function SchedulePage({ onToast }) {
     });
   }, [positions, positionTabs]);
 
-  // For the Assign Shift filter: unlike activePositions above, this doesn't need
-  // a real `positions` table row (no staffing_requirement FK involved here — the
-  // shift assignment just stores the employee's position as text). Building it
-  // straight from positionTabs means it shows every position an active employee
-  // actually has, even if that position never got mirrored into the `positions`
-  // table (e.g. employees inserted directly into the DB rather than through the
-  // Employee Management create/update form, which is what upserts `positions`).
   const assignablePositions = useMemo(
     () => positionTabs.map(t => ({ id: t.name, name: t.name })),
     [positionTabs]
   );
 
-  // ─── REQUIREMENT MODAL LOGIC ──────────────────────────────────────────────────
-  // New requirements default to covering the whole visible week in one step —
-  // the person can then adjust or remove individual days later by clicking that
-  // day's cell in the matrix, instead of having to add each day one at a time.
   const openReqModal = (prefill) => {
     setEditingReq(prefill);
     if (!prefill?.id) setReqDays(datesInRange);
@@ -808,27 +1145,53 @@ export default function SchedulePage({ onToast }) {
 
   const saveRequirement = async () => {
     try {
-      if (editingReq?.id) {
-        await api.updateStaffingRequirement(editingReq.id, { required_count: editingReq.required_count, notes: editingReq.notes });
-        onToast('Requirement saved', 'success');
+      if (canManageDirectly) {
+        if (editingReq?.id) {
+          await api.updateStaffingRequirement(editingReq.id, { required_count: editingReq.required_count, notes: editingReq.notes });
+          onToast('Requirement saved', 'success');
+        } else {
+          if (reqDays.length === 0) return onToast('Pick at least one day', 'error');
+          const existingDates = new Set(
+            coverage
+              .filter(c => c.position_id === editingReq.position_id && c.shift_template_id === editingReq.shift_template_id)
+              .map(c => c.date)
+          );
+          const toCreate = reqDays.filter(d => !existingDates.has(d));
+          if (toCreate.length === 0) return onToast('Those days already have a requirement set', 'error');
+          await Promise.all(toCreate.map(date => api.createStaffingRequirement({
+            position_id: editingReq.position_id,
+            shift_template_id: editingReq.shift_template_id,
+            date,
+            required_count: editingReq.required_count,
+            notes: editingReq.notes
+          })));
+          const skipped = reqDays.length - toCreate.length;
+          onToast(skipped > 0 ? `Added for ${toCreate.length} day(s) — ${skipped} already had a requirement` : `Added for ${toCreate.length} day(s)`, 'success');
+        }
       } else {
-        if (reqDays.length === 0) return onToast('Pick at least one day', 'error');
-        const existingDates = new Set(
-          coverage
-            .filter(c => c.position_id === editingReq.position_id && c.shift_template_id === editingReq.shift_template_id)
-            .map(c => c.date)
-        );
-        const toCreate = reqDays.filter(d => !existingDates.has(d));
-        if (toCreate.length === 0) return onToast('Those days already have a requirement set', 'error');
-        await Promise.all(toCreate.map(date => api.createStaffingRequirement({
-          position_id: editingReq.position_id,
-          shift_template_id: editingReq.shift_template_id,
-          date,
-          required_count: editingReq.required_count,
-          notes: editingReq.notes
-        })));
-        const skipped = reqDays.length - toCreate.length;
-        onToast(skipped > 0 ? `Added for ${toCreate.length} day(s) — ${skipped} already had a requirement` : `Added for ${toCreate.length} day(s)`, 'success');
+        // hr_staff / hr_manager: propose instead of writing live — approval
+        // upserts onto the matching date whether one already exists or not,
+        // so editing an existing cell and adding a new one both just propose.
+        if (editingReq?.id) {
+          await api.proposeStaffingRequirement({
+            position_id: editingReq.position_id,
+            shift_template_id: editingReq.shift_template_id,
+            date: editingReq.date,
+            required_count: editingReq.required_count,
+            notes: editingReq.notes,
+          });
+          onToast('Change proposed — pending approval', 'success');
+        } else {
+          if (reqDays.length === 0) return onToast('Pick at least one day', 'error');
+          await Promise.all(reqDays.map(date => api.proposeStaffingRequirement({
+            position_id: editingReq.position_id,
+            shift_template_id: editingReq.shift_template_id,
+            date,
+            required_count: editingReq.required_count,
+            notes: editingReq.notes,
+          })));
+          onToast(`Proposed for ${reqDays.length} day(s) — pending approval`, 'success');
+        }
       }
       setShowReqModal(false);
       load();
@@ -848,7 +1211,6 @@ export default function SchedulePage({ onToast }) {
     return `${s.toLocaleDateString('en-US', opts)} – ${e.toLocaleDateString('en-US', opts)}, ${year}`;
   }, [range]);
 
-  // Requirements + roster filtered down to just the selected position tab
   const filteredCoverage = useMemo(() => {
     if (!selectedPosition) return [];
     return coverage.filter(c => (c.positions?.name || 'Unassigned') === selectedPosition);
@@ -882,9 +1244,16 @@ export default function SchedulePage({ onToast }) {
 
   const currentPositionId = activePositions.find(p => p.name === selectedPosition)?.id || activePositions[0]?.id || '';
 
-  // Every coverage cell that isn't fully staffed, oldest date first. Clicking the
-  // "N short-staffed" indicator switches to that cell's position tab (if needed) and
-  // highlights it; clicking again cycles to the next one so all of them are reachable.
+  const todayStr = toISODate(new Date());
+  const onLeaveTodayCount = useMemo(
+    () => Object.keys(leaveMap[todayStr] || {}).length,
+    [leaveMap, todayStr]
+  );
+  const unscheduledCount = useMemo(
+    () => activeEmployees.filter(e => !datesInRange.some(date => assignmentMap[date]?.[e.id])).length,
+    [activeEmployees, datesInRange, assignmentMap]
+  );
+
   const understaffedList = useMemo(
     () => coverage.filter(c => c.status !== 'full').sort((a, b) => a.date.localeCompare(b.date)),
     [coverage]
@@ -902,25 +1271,42 @@ export default function SchedulePage({ onToast }) {
 
   return (
     <div className="page">
-      {/* Header — title + subtitle only. Primary actions live in the panel toolbar below,
-          right next to the week/position context they operate on, instead of duplicated
-          up here disconnected from that context. */}
       <div style={{ marginBottom: 24 }}>
         <h2 style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.5px' }}>Shift &amp; Schedule Management</h2>
         <p className="text-dim text-sm" style={{ marginTop: 4 }}>{assignments.filter(a => !a.is_day_off).length} shift(s) · {assignments.filter(a => a.is_day_off).length} rest day(s) scheduled</p>
       </div>
 
-      {/* Driver Availability (Separate Card) */}
+      {/* Driver Availability */}
       <DriverAvailabilityPanel onToast={onToast} />
 
-      {/* MERGED PANEL */}
+      {/* Pending schedule proposals — managers/admin only */}
+      {canApprove && <PendingProposalsPanel onToast={onToast} refreshSignal={range.start} />}
+
+      <ScheduleStatCards
+        totals={totals}
+        understaffedCount={totals.understaffed_slots}
+        onLeaveCount={onLeaveTodayCount}
+        unscheduledCount={unscheduledCount}
+        onJumpShortStaffed={jumpToShortStaffed}
+      />
+
       <div className="card">
-        {/* Week controls + totals + all primary actions (Manage Templates, Add requirement, Assign Shift) */}
         <div className="flex-between" style={{ padding: '16px 20px', borderBottom: '1px solid var(--border)', flexWrap: 'wrap', gap: '12px' }}>
           <div className="flex-center gap-2">
             <button className="btn btn-icon btn-ghost btn-sm" onClick={() => shiftWeek(-1)}><ChevronLeft size={14} /></button>
             <span style={{ fontWeight: 600 }}>{rangeLabel}</span>
             <button className="btn btn-icon btn-ghost btn-sm" onClick={() => shiftWeek(1)}><ChevronRight size={14} /></button>
+            <button
+              className="btn btn-ghost btn-sm"
+              onClick={() => {
+                const start = startOfWeek(new Date());
+                const end = new Date(start); end.setDate(end.getDate() + 6);
+                setRange({ start: toISODate(start), end: toISODate(end) });
+              }}
+              style={{ marginLeft: 4 }}
+            >
+              Today
+            </button>
           </div>
           <div className="flex-center gap-2" style={{ flexWrap: 'wrap' }}>
             <span className="text-dim text-sm">{totals.total_assigned} of {totals.total_required} slots filled</span>
@@ -936,7 +1322,9 @@ export default function SchedulePage({ onToast }) {
               </button>
             )}
             <span style={{ width: 1, height: 20, background: 'var(--border)', margin: '0 2px' }} />
-            <button className="btn btn-ghost btn-sm" onClick={() => setShowTemplates(true)}><Clock size={13} /> Manage Templates</button>
+            {canManageDirectly && (
+              <button className="btn btn-ghost btn-sm" onClick={() => setShowTemplates(true)}><Clock size={13} /> Manage Templates</button>
+            )}
             <button
               className="btn btn-primary btn-sm"
               onClick={() => openReqModal({
@@ -947,15 +1335,14 @@ export default function SchedulePage({ onToast }) {
               })}
               disabled={activePositions.length === 0 || templates.length === 0}
             >
-              <Plus size={13} /> Add requirement
+              <Plus size={13} /> {canManageDirectly ? 'Add requirement' : 'Propose requirement'}
             </button>
             <button className="btn btn-primary btn-sm" onClick={() => setShowAssign(true)} disabled={employees.length === 0}>
-              <Plus size={13} /> Assign Shift
+              <Plus size={13} /> {canManageDirectly ? 'Assign Shift' : 'Propose Shift'}
             </button>
           </div>
         </div>
 
-        {/* Position picker — tabs for a few positions, searchable dropdown once there are many */}
         <PositionPicker tabs={positionTabs} selected={selectedPosition} onSelect={setSelectedPosition} />
 
         {loading ? (
@@ -964,7 +1351,6 @@ export default function SchedulePage({ onToast }) {
           <div className="empty-state" style={{ padding: 40 }}><Users size={32} /><p>No active employees yet.</p></div>
         ) : (
           <div style={{ padding: '16px 20px' }}>
-            {/* 1. REQUIREMENTS MATRIX for the selected position */}
             {requirementRows.length === 0 ? (
               <div className="empty-state" style={{ padding: '12px 0 24px' }}>
                 <p className="text-dim text-sm">No staffing requirements set for {selectedPosition} this week yet.</p>
@@ -975,12 +1361,11 @@ export default function SchedulePage({ onToast }) {
                 rows={requirementRows}
                 dates={datesInRange}
                 onCellClick={openReqModal}
-                onDeleteRow={deleteRequirementRow}
+                onDeleteRow={canManageDirectly ? deleteRequirementRow : undefined}
                 highlightedCell={highlightedCell}
               />
             )}
 
-            {/* 2. EMPLOYEE LIST for the selected position */}
             <div style={{ marginTop: 8 }}>
               <div className="flex-between" style={{ marginBottom: 14, flexWrap: 'wrap', gap: 10 }}>
                 <div style={{ position: 'relative', flex: '1 1 220px', maxWidth: 320 }}>
@@ -1037,9 +1422,18 @@ export default function SchedulePage({ onToast }) {
           templates={templates}
           positions={assignablePositions}
           defaultPosition={selectedPosition}
+          directWrite={canManageDirectly}
           onClose={() => setShowAssign(false)}
-          onAssign={async (b) => { await api.assignShift(b); load(); }}
-          onAssignRecurring={async (b) => { await api.assignRecurringShift(b); load(); }}
+          onAssign={async (b) => {
+            if (canManageDirectly) { await api.assignShift(b); }
+            else { await api.proposeShift(b); }
+            load();
+          }}
+          onAssignRecurring={async (b) => {
+            if (canManageDirectly) { await api.assignRecurringShift(b); }
+            else { await api.proposeRecurringShift(b); }
+            load();
+          }}
           onToast={onToast}
         />
       )}
@@ -1048,7 +1442,11 @@ export default function SchedulePage({ onToast }) {
         <div className="modal-overlay">
           <div className="modal">
             <div className="modal-header">
-              <span className="modal-title">{editingReq?.id ? 'Edit Requirement' : 'Set Requirement'}</span>
+              <span className="modal-title">
+                {editingReq?.id
+                  ? (canManageDirectly ? 'Edit Requirement' : 'Propose Requirement Change')
+                  : (canManageDirectly ? 'Set Requirement' : 'Propose Requirement')}
+              </span>
               <button className="btn btn-icon btn-ghost" onClick={() => setShowReqModal(false)}>✕</button>
             </div>
             <div className="form-grid">
@@ -1093,7 +1491,9 @@ export default function SchedulePage({ onToast }) {
                     })}
                   </div>
                   <p className="text-dim" style={{ fontSize: '0.72rem', marginTop: 6 }}>
-                    Creates one requirement per selected day. Days that already have one are skipped — edit those from the matrix instead.
+                    {canManageDirectly
+                      ? 'Creates one requirement per selected day. Days that already have one are skipped — edit those from the matrix instead.'
+                      : 'Proposes one requirement per selected day, pending approval — including days that already have one set.'}
                   </p>
                 </div>
               )}
@@ -1107,13 +1507,13 @@ export default function SchedulePage({ onToast }) {
               </div>
             </div>
             <div className="modal-footer">
-              {editingReq?.id && (
+              {editingReq?.id && canManageDirectly && (
                 <button className="btn btn-danger" style={{ marginRight: 'auto' }} onClick={() => { setShowReqModal(false); removeRequirement(editingReq); }}>
                   <Trash2 size={13} /> Delete
                 </button>
               )}
               <button className="btn btn-ghost" onClick={() => setShowReqModal(false)}>Cancel</button>
-              <button className="btn btn-primary" onClick={saveRequirement}>Save</button>
+              <button className="btn btn-primary" onClick={saveRequirement}>{canManageDirectly ? 'Save' : 'Propose'}</button>
             </div>
           </div>
         </div>
