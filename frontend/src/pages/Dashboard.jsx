@@ -69,7 +69,7 @@ function getBreakSegments(punches, labelByType = {}) {
     .filter(Boolean);
 }
 
-const STATUS_FILTERS = ['all', 'present', 'late', 'absent'];
+const STATUS_FILTERS = ['all', 'present', 'late', 'absent', 'scheduled'];
 
 // Animates a number counting up/down to its target whenever it changes
 function useCountUp(target, duration = 500) {
@@ -183,12 +183,13 @@ export default function Dashboard() {
     const map = new Map();
     for (const r of records) {
       const dept = r.employees?.department || 'Unassigned';
-      if (!map.has(dept)) map.set(dept, { dept, present: 0, late: 0, absent: 0, total: 0 });
+      if (!map.has(dept)) map.set(dept, { dept, present: 0, late: 0, absent: 0, scheduled: 0, total: 0 });
       const entry = map.get(dept);
       entry.total += 1;
       if (r.status === 'present') entry.present += 1;
       else if (r.status === 'late') entry.late += 1;
       else if (r.status === 'absent') entry.absent += 1;
+      else if (r.status === 'scheduled') entry.scheduled += 1;
     }
     return [...map.values()].sort((a, b) => b.total - a.total);
   }, [records]);

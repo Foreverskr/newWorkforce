@@ -644,6 +644,10 @@ tbody td:first-child {
   background: var(--amber-bg);
   color: var(--amber);
 }
+.badge.scheduled {
+  background: rgba(59, 130, 246, 0.15);
+  color: var(--accent, #3b82f6);
+}
 .badge.approved {
   background: var(--green-bg);
   color: var(--green);

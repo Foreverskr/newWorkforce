@@ -38,7 +38,7 @@ const employeeLocks = new Map();
 function withEmployeeLock(employee_id, fn) {
   const prior = employeeLocks.get(employee_id) || Promise.resolve();
   const run = prior.then(fn, fn);
-  employeeLocks.set(employee_id, run.catch(() => {}));
+  employeeLocks.set(employee_id, run.catch(() => { }));
   return run;
 }
 
@@ -265,16 +265,8 @@ async function recordPunchLocked({ employee_id, date, punchTime, validateAction 
 
   let attendanceRow = attendance;
 
-  // First punch of the day → create the attendance record (same
-  // scheduling / leave checks the old clockIn() did).
-  if (!attendanceRow) {
-    const todaysShift = await getEmployeeShiftForDate(employee_id, date);
-    if (!todaysShift || todaysShift.is_day_off || !todaysShift.role_id) {
-      const err = new Error('No shift scheduled for today — contact your admin to get scheduled before clocking in.');
-      err.status = 403;
-      throw err;
-    }
-
+  // First punch of the day: enforce leave and shift guards, and create/update attendance row
+  if (punches.length === 0) {
     const { data: activeLeave } = await supabase
       .from('leaves')
       .select('id, type, start_date, end_date')
@@ -289,6 +281,13 @@ async function recordPunchLocked({ employee_id, date, punchTime, validateAction 
       throw err;
     }
 
+    const todaysShift = await getEmployeeShiftForDate(employee_id, date);
+    if (!todaysShift || todaysShift.is_day_off || !todaysShift.role_id) {
+      const err = new Error('No shift scheduled for today — contact your admin to get scheduled before clocking in.');
+      err.status = 403;
+      throw err;
+    }
+
     const shiftStart = await resolveShiftStart(employee_id, todaysShift);
     let status = 'present';
     if (shiftStart) {
@@ -296,17 +295,34 @@ async function recordPunchLocked({ employee_id, date, punchTime, validateAction 
       if (timeToMinutes(punchTime.slice(0, 5)) > graceLimitMinutes) status = 'late';
     }
 
-    const { data: created, error: createError } = await supabase
-      .from('attendance')
-      .insert([{
-        employee_id, date, clock_in: punchTime, clock_out: null,
-        hours_worked: null, break_minutes: 0, net_hours_worked: null,
-        status, notes: null, auto_clock_out: false, is_finalized: false,
-      }])
-      .select()
-      .single();
-    if (createError) throw createError;
-    attendanceRow = created;
+    if (attendanceRow) {
+      const { data: updated, error: updateError } = await supabase
+        .from('attendance')
+        .update({
+          clock_in: punchTime,
+          status,
+          notes: null,
+          source_leave_id: null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', attendanceRow.id)
+        .select()
+        .single();
+      if (updateError) throw updateError;
+      attendanceRow = updated;
+    } else {
+      const { data: created, error: createError } = await supabase
+        .from('attendance')
+        .insert([{
+          employee_id, date, clock_in: punchTime, clock_out: null,
+          hours_worked: null, break_minutes: 0, net_hours_worked: null,
+          status, notes: null, auto_clock_out: false, is_finalized: false,
+        }])
+        .select()
+        .single();
+      if (createError) throw createError;
+      attendanceRow = created;
+    }
   }
 
   const nextSequence = punches.length + 1;
@@ -435,12 +451,13 @@ export async function getToday(req, res) {
 
   const { data: assignments, error: assignError } = await supabase
     .from('shift_assignments')
-    .select('employee_id')
+    .select('employee_id, role_id, shift_templates:roles(start_time, end_time)')
     .eq('date', today)
     .eq('is_day_off', false)
     .not('role_id', 'is', null);
   if (assignError) return handleError(res, assignError);
 
+  const assignmentMap = Object.fromEntries((assignments || []).map(a => [a.employee_id, a]));
   const scheduledEmployeeIds = [...new Set((assignments || []).map(a => a.employee_id).filter(Boolean))];
 
   const { data: attendanceData, error: attendanceError } = await supabase
@@ -457,36 +474,66 @@ export async function getToday(req, res) {
   if (empIds.length > 0) {
     const { data: employees, error: empLookupError } = await supabase
       .from('employees')
-      .select('id, employee_id, name, department, shift_start, shift_end')
+      .select('id, employee_id, name, department, position, shift_start, shift_end')
       .in('id', empIds);
     if (empLookupError) return handleError(res, empLookupError);
     empMap = Object.fromEntries((employees || []).map(e => [e.id, e]));
   }
 
+  // Determine current time in Asia/Manila for shift start comparison
+  const nowParts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Manila',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).formatToParts(new Date());
+  const nowObj = Object.fromEntries(nowParts.filter(p => p.type !== 'literal').map(p => [p.type, p.value]));
+  const nowMinutes = Number(nowObj.hour) * 60 + Number(nowObj.minute);
+
   try {
     const attendanceWithPunches = await attachPunches(attendanceData);
     const attendanceByEmployee = Object.fromEntries(attendanceWithPunches.map(r => [r.employee_id, r]));
 
-    const records = scheduledEmployeeIds.map(employeeId => {
-      const existing = attendanceByEmployee[employeeId];
-      if (existing) {
-        return { ...existing, employees: empMap[employeeId] || null };
-      }
+    // Start with all existing attendance records (both scheduled and unscheduled)
+    const recordedIds = new Set();
+    const records = attendanceWithPunches.map(record => {
+      recordedIds.add(record.employee_id);
       return {
+        ...record,
+        employees: empMap[record.employee_id] || null,
+      };
+    });
+
+    // Add unrecorded scheduled employees
+    for (const employeeId of scheduledEmployeeIds) {
+      if (recordedIds.has(employeeId)) continue;
+
+      const shiftStart = assignmentMap[employeeId]?.shift_templates?.start_time || empMap[employeeId]?.shift_start;
+      let status = 'scheduled';
+
+      if (shiftStart) {
+        const shiftStartMinutes = timeToMinutes(shiftStart.slice(0, 5));
+        const graceLimit = shiftStartMinutes + 15;
+        // If current time is past shift start + 15 min grace period, mark absent
+        if (nowMinutes >= graceLimit) {
+          status = 'absent';
+        }
+      }
+
+      records.push({
         id: `unrecorded-${employeeId}`,
         employee_id: employeeId,
         date: today,
         clock_in: null,
         clock_out: null,
-        status: 'absent',
+        status,
         punches: [],
         employees: empMap[employeeId] || null,
-      };
-    });
+      });
+    }
 
     const present = records.filter(r => r.status === 'present').length;
     const late = records.filter(r => r.status === 'late').length;
     const absent = records.filter(r => r.status === 'absent').length;
+    const scheduled = records.filter(r => r.status === 'scheduled').length;
 
     res.json({
       date: today,
@@ -495,6 +542,7 @@ export async function getToday(req, res) {
       present,
       late,
       absent,
+      scheduled,
       records,
     });
   } catch (err) {
@@ -805,7 +853,44 @@ export async function punch(req, res) {
     const statusCode = action.meaning === 'shift_start' ? 201 : 200;
     res.status(statusCode).json({ action: action.meaning, ...payload });
   } catch (err) {
-    if (err.status) return res.status(err.status).json({ action: 'error', error: err.message });
+    if (err.status) {
+      // recordPunchLocked() throws 403 for two reasons: no shift scheduled
+      // for the date, or an approved leave covering the date. Neither can
+      // ever resolve by retrying — the missing shift/leave record won't
+      // appear on its own. For a LIVE kiosk punch (no client_timestamp —
+      // see punchAttendance() in the firmware, which never sends that
+      // field) this is fine as-is: the employee sees "No shift today" on
+      // the kiosk screen immediately and it's never queued.
+      //
+      // For an OFFLINE REPLAY (client_timestamp present — only
+      // syncPendingPunches() sends it) this is different: nobody is
+      // standing at the kiosk to see the error, and the firmware would
+      // otherwise keep this line in pending_punches.csv and resend the
+      // exact same request every SYNC_INTERVAL_MS forever. Log it to
+      // unresolved_kiosk_punches for admin review and respond 422 so the
+      // firmware treats it as resolved (see the HTTP 422 branch in
+      // syncPendingPunches()) and drops it from the queue — the event
+      // itself isn't lost, it just stops being auto-retried.
+      const isTerminalValidationFailure = err.status === 403;
+      if (isTerminalValidationFailure && client_timestamp) {
+        const { error: logError } = await supabase.from('unresolved_kiosk_punches').insert([{
+          employee_id,
+          date: today,
+          punch_time: punchTime,
+          reason: err.message,
+          device_client_timestamp: client_timestamp,
+        }]);
+        if (logError) {
+          // Logging failed too — don't silently eat the punch by returning
+          // 422 in that case, fall back to the old behavior (device keeps
+          // retrying) so nothing is lost even though it's stuck.
+          console.error('[punch] failed to log unresolved offline punch:', logError);
+          return res.status(err.status).json({ error: err.message, nextAction: err.nextAction });
+        }
+        return res.status(422).json({ action: 'needs_review', error: err.message });
+      }
+      return res.status(err.status).json({ error: err.message, nextAction: err.nextAction });
+    }
     return handleError(res, err);
   }
 }
@@ -845,6 +930,36 @@ export async function updateBreakPolicyConfig(req, res) {
   if (error) return handleError(res, error);
   invalidateBreakPolicyCache();
   res.json(data);
+}
+
+// ─── unresolved offline punches (admin review) ─────────────────────────────
+// Offline punches that failed with a terminal validation error (no shift /
+// on leave) when replayed from a kiosk's SD queue land here instead of
+// being retried forever or silently dropped — see the punch() catch block
+// above. Needs a matching route registered, e.g.:
+//   router.get('/unresolved-kiosk-punches', getUnresolvedKioskPunches);
+//   router.delete('/unresolved-kiosk-punches/:id', dismissUnresolvedKioskPunch);
+
+export async function getUnresolvedKioskPunches(req, res) {
+  const { data, error } = await supabase
+    .from('unresolved_kiosk_punches')
+    .select('*, employees(name, employee_id, department)')
+    .order('created_at', { ascending: false });
+  if (error) return handleError(res, error);
+  res.json(data);
+}
+
+// Admin has looked at it and either fixed the underlying issue manually
+// (e.g. added a backdated shift assignment + a manual attendance row via
+// create()) or decided to write it off — either way, dismiss it from the
+// review queue.
+export async function dismissUnresolvedKioskPunch(req, res) {
+  const { error } = await supabase
+    .from('unresolved_kiosk_punches')
+    .delete()
+    .eq('id', req.params.id);
+  if (error) return handleError(res, error);
+  res.json({ message: 'Dismissed' });
 }
 
 // ─── fingerprint enrollment sync ───────────────────────────────────────────
